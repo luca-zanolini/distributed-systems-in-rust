@@ -14,4 +14,5 @@ Each folder is an independent Cargo project you can build and run on its own.
 
 ## Author
 
-Luca Zanolini — [github.com/luca-zanolini](https://github.com/luca-zanolini)
+**Luca Zanolini**
+[Website](https://lucazanolini.com) · [GitHub](https://github.com/luca-zanolini) · [LinkedIn](https://www.linkedin.com/in/luca-zanolini) · [X](https://x.com/luca_zanolini)
