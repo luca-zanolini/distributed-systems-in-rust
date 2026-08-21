@@ -10,7 +10,7 @@ Each folder is an independent Cargo project you can build and run on its own.
 
 | #  | Project | Focus |
 |----|---------|-------|
-| 01 | [`01-kv-store`](01-kv-store) | Key-value store — Rust fundamentals and the core of every distributed store *(in progress)* |
+| 01 | [`01-kv-store`](01-kv-store) | Persistent key-value store + REPL (JSON via serde). Rust fundamentals and the core of every distributed store. ✅ |
 
 ## Author
 

@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
 
+#[derive(Serialize, Deserialize)]
 struct Store {
     map: HashMap<String, String>,
 }
@@ -24,30 +26,23 @@ impl Store {
         self.map.remove(key)
     }
 
-    fn save(&self, path: &str) -> std::io::Result<()> {
-        let mut data = String::new();
-        for (key, value) in &self.map {
-            data.push_str(&format!("{key}\t{value}\n"));
-        }
-        std::fs::write(path, data)?;
+    fn save(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, json)?;
         Ok(())
     }
 
-    fn load(&mut self, path: &str) -> std::io::Result<()> {
+    fn load(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
         if !std::path::Path::new(path).exists() {
-            return Ok(()); 
+            return Ok(());
         }
         let contents = std::fs::read_to_string(path)?;
-        for line in contents.lines() {
-            if let Some((key, value)) = line.split_once('\t') {
-                self.map.insert(key.to_string(), value.to_string());
-            }
-        }
+        *self = serde_json::from_str(&contents)?;
         Ok(())
     }
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::new();
     store.load("store.db")?;
     loop {
@@ -58,7 +53,10 @@ fn main() -> std::io::Result<()> {
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
         match parts.as_slice() {
-            ["set", key, value] => store.set(key.to_string(), value.to_string()),
+            ["set", key, rest @ ..] => {
+                let value = rest.join(" ");
+                store.set(key.to_string(), value);
+            }
             ["get", key] => match store.get(key) {
                 Some(value) => println!("{}", value),
                 None => println!("Key not found"),
@@ -69,11 +67,37 @@ fn main() -> std::io::Result<()> {
             },
             [] => {}
             ["exit"] => {
-                store.save("store.db").expect("Failed to save store");
+                store.save("store.db")?;
                 break;
             }
             _ => println!("unknown command"),
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_and_get() {
+        let mut store = Store::new();
+        store.set("k".to_string(), "v".to_string());
+        assert_eq!(store.get("k"), Some(&"v".to_string()));
+    }
+
+    #[test]
+    fn missing_key() {
+        let store = Store::new();
+        assert_eq!(store.get("missing"), None);
+    }
+
+    #[test]
+    fn remove_key() {
+        let mut store = Store::new();
+        store.set("k".to_string(), "v".to_string());
+        assert_eq!(store.remove("k"), Some("v".to_string()));
+        assert_eq!(store.get("k"), None);
+    }
 }
