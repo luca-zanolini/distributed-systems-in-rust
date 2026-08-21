@@ -1,0 +1,5 @@
+# Rust build artifacts (each crate's target/ directory, at any depth)
+target/
+
+# macOS
+.DS_Store
