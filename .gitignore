@@ -1,5 +1,8 @@
 # Rust build artifacts (each crate's target/ directory, at any depth)
 target/
 
+# Runtime data (the persisted key-value store)
+store.db
+
 # macOS
 .DS_Store
