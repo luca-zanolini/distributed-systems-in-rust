@@ -45,7 +45,7 @@ fn forward(addr: &str, line: &str) -> std::io::Result<String> {
 fn handle_client(
     store: Arc<Mutex<Store>>,
     stream: TcpStream,
-    backup: Option<String>,
+    backups: Vec<String>,
 ) -> std::io::Result<()> {
     let mut writer = stream.try_clone()?; // 2nd handle to the SAME socket, for writing
     let reader = BufReader::new(stream); // wrap the socket to read it line by line
@@ -78,13 +78,10 @@ fn handle_client(
 
         let is_write = matches!(parts.as_slice(), ["set", ..] | ["remove", ..]);
         if is_write {
-            if let Some(addr) = &backup {
-                match forward(addr, &line) {
-                    Ok(_ack) => { /* backup confirmed → keep the OK */ }
-                    Err(e) => {
-                        eprintln!("replication to {addr} failed: {e}");
-                        response = "ERR replication failed\n".to_string(); // sync: don't claim OK if the backup didn't get it
-                    }
+            for addr in &backups {
+                if let Err(e) = forward(addr, &line) {
+                    eprintln!("replication to {addr} failed: {e}");
+                    response = "ERR replication failed\n".to_string();
                 }
             }
         }
@@ -96,14 +93,15 @@ fn handle_client(
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let port = args.get(1).map(String::as_str).unwrap_or("4000");
-    let backup = args.get(2).cloned(); // backup address (optional) -> Option<&String>
+    let backups: Vec<String> = args.iter().skip(2).cloned().collect();
+    if backups.is_empty() {
+        println!("node on :{port} — standalone / backup");
+    } else {
+        println!("PRIMARY on :{port} — forwarding writes to {backups:?}");
+    }
 
     // Result return so we can use ?
     let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?; // claim the port, start listening
-    match &backup {
-        Some(addr) => println!("PRIMARY on :{port} — forwarding writes to {addr}"),
-        None => println!("node on :{port} — standalone / backup"),
-    }
 
     let store = Arc::new(Mutex::new(Store::new())); // shared, lockable store
     for stream in listener.incoming() {
@@ -115,10 +113,10 @@ fn main() -> std::io::Result<()> {
             }
         };
         let store = Arc::clone(&store); // a handle for THIS client's thread
-        let backup = backup.clone();
+        let backups = backups.clone();
         thread::spawn(move || {
             // serve it concurrently
-            if let Err(e) = handle_client(store, stream, backup) {
+            if let Err(e) = handle_client(store, stream, backups) {
                 eprintln!("client error: {e}");
             }
         });
