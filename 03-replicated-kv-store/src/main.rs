@@ -33,11 +33,13 @@ impl Store {
     }
 }
 
-fn forward(addr: &str, line: &str) -> std::io::Result<()> {
+fn forward(addr: &str, line: &str) -> std::io::Result<String> {
     let mut b = TcpStream::connect(addr)?;
     b.write_all(line.as_bytes())?;
     b.write_all(b"\n")?;
-    Ok(())
+    let mut ack = String::new();
+    BufReader::new(&b).read_line(&mut ack)?; // ← wait for the backup to confirm
+    Ok(ack)
 }
 
 fn handle_client(
@@ -51,7 +53,7 @@ fn handle_client(
         // one iteration per COMMAND line from this client
         let line = line?; // the line (newline stripped), or an I/O error
         let parts: Vec<&str> = line.split_whitespace().collect(); // split into words
-        let response = match parts.as_slice() {
+        let mut response = match parts.as_slice() {
             ["set", key, rest @ ..] => {
                 store.lock().unwrap().set(key.to_string(), rest.join(" ")); // lock → mutate → auto-unlock
                 "OK\n".to_string()
@@ -77,8 +79,12 @@ fn handle_client(
         let is_write = matches!(parts.as_slice(), ["set", ..] | ["remove", ..]);
         if is_write {
             if let Some(addr) = &backup {
-                if let Err(e) = forward(addr, &line) {
-                    eprintln!("replication to {addr} failed: {e}"); // best-effort for now
+                match forward(addr, &line) {
+                    Ok(_ack) => { /* backup confirmed → keep the OK */ }
+                    Err(e) => {
+                        eprintln!("replication to {addr} failed: {e}");
+                        response = "ERR replication failed\n".to_string(); // sync: don't claim OK if the backup didn't get it
+                    }
                 }
             }
         }
