@@ -88,3 +88,29 @@ fn main() -> std::io::Result<()> {
     }
     Ok(()) // unreachable in practice: the accept loop runs forever
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_and_get() {
+        let mut store = Store::new();
+        store.set("k".to_string(), "v".to_string());
+        assert_eq!(store.get("k"), Some(&"v".to_string()));
+    }
+
+    #[test]
+    fn missing_key_is_none() {
+        let store = Store::new();
+        assert_eq!(store.get("missing"), None);
+    }
+
+    #[test]
+    fn remove_returns_value_then_gone() {
+        let mut store = Store::new();
+        store.set("k".to_string(), "v".to_string());
+        assert_eq!(store.remove("k"), Some("v".to_string()));
+        assert_eq!(store.get("k"), None);
+    }
+}
