@@ -78,11 +78,17 @@ fn handle_client(
 
         let is_write = matches!(parts.as_slice(), ["set", ..] | ["remove", ..]);
         if is_write {
+            let mut acks = 1; // the primary already has it → counts as 1
             for addr in &backups {
-                if let Err(e) = forward(addr, &line) {
-                    eprintln!("replication to {addr} failed: {e}");
-                    response = "ERR replication failed\n".to_string();
+                match forward(addr, &line) {
+                    Ok(_) => acks += 1,
+                    Err(e) => eprintln!("replication to {addr} failed: {e}"),
                 }
+            }
+            let total = backups.len() + 1; // primary + all backups
+            let quorum = total / 2 + 1; // a majority
+            if acks < quorum {
+                response = format!("ERR no quorum ({acks}/{total}, need {quorum})\n");
             }
         }
         writer.write_all(response.as_bytes())?; // send the response back over the socket
