@@ -66,6 +66,15 @@ fn handle_client(
                     None => "Key not found\n".to_string(),
                 } // guard drops here → unlock
             }
+            ["dump"] => {
+                let guard = store.lock().unwrap();
+                let mut out = String::new();
+                for (key, value) in &guard.map {
+                    out.push_str(&format!("set {key} {value}\n"));
+                }
+                out.push_str("END\n");
+                out // tail expression → this arm's value
+            }
             ["remove", key] => {
                 match store.lock().unwrap().remove(key) {
                     // lock → remove → auto-unlock
@@ -99,7 +108,17 @@ fn handle_client(
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let port = args.get(1).map(String::as_str).unwrap_or("4000");
-    let backups: Vec<String> = args.iter().skip(2).cloned().collect();
+    let mut backups: Vec<String> = Vec::new();
+    let mut catch_up: Option<String> = None;
+    let mut rest = args.iter().skip(2);
+    while let Some(arg) = rest.next() {
+        if arg.as_str() == "--catch-up" {
+            catch_up = rest.next().cloned(); // consume the NEXT arg as the primary's address
+        } else {
+            backups.push(arg.clone());
+        }
+    }
+
     if backups.is_empty() {
         println!("node on :{port} — standalone / backup");
     } else {
@@ -110,6 +129,29 @@ fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?; // claim the port, start listening
 
     let store = Arc::new(Mutex::new(Store::new())); // shared, lockable store
+                                                    // Catch-up (anti-entropy): a recovering node pulls a full snapshot before it serves.
+    if let Some(primary) = &catch_up {
+        println!("catching up from {primary} ...");
+        let mut conn = TcpStream::connect(primary)?; // open a connection (just like forward())
+        conn.write_all(b"dump\n")?; // ask for the snapshot
+        let reader = BufReader::new(&conn); // read the reply line by line
+        for line in reader.lines() {
+            let line = line?;
+            if line == "END" {
+                break;
+            } // sentinel → snapshot complete
+            if let Some(stripped) = line.strip_prefix("set ") {
+                let mut parts = stripped.splitn(2, ' ');
+                if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+                    store
+                        .lock()
+                        .unwrap()
+                        .set(key.to_string(), value.to_string());
+                }
+            }
+        }
+        println!("caught up.");
+    }
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
