@@ -93,6 +93,16 @@ the last cell is the doorway out of this project.
 > 3. **Read quorum masks staleness (M6):** restart a node **empty**; a `get` on it still returns
 >    the latest value (it polls a majority), while `readts` on it shows its own copy is empty.
 
+> **⚠️ An honest caveat — quorum reads are redundant *here*.** With a single **fixed** primary
+> (the design `03` actually runs), the primary writes *before* it replicates, so it is **never
+> stale** — a plain read-one from it would always be correct, and the read quorum buys nothing.
+> They become load-bearing only once the **read coordinator can itself be stale**: after
+> **failover** (the primary crashes and a replica that missed the last write takes over), or when
+> **any node** may serve reads. A replica is never fresher than the primary *that coordinated its
+> write* — but it can be fresher than a *different, later* coordinator that missed it. That is why
+> experiment 3 reads from a stale **non-primary** node: `03` builds the correct, general read;
+> project `04` (leader election / failover) is what gives it a reason to exist.
+
 ### 5. The open questions `03` leaves — and why they need consensus
 
 Even as a finished register, `03` cannot answer several questions, and **each is a consensus
@@ -146,7 +156,10 @@ needed before you build it.
 
 **Honest limits — the syllabus beyond this project (each a signpost):**
 
-- **No failover.** The primary is fixed; if it dies, no one is elected. *(→ leader election, Raft.)*
+- **No failover — so quorum reads are redundant *today*.** The primary is fixed; if it dies, no one
+  is elected. And because a fixed primary is never stale, a read-one from it would already be
+  correct — the **read quorum only pays off once the coordinator can be stale** (failover, or reads
+  served by any node). *(→ leader election, Raft.)*
 - **Single writer.** Keeps timestamps tie-free; multiple writers need vector clocks / an `(N,N)`
   register. *(→ CCGR §4.4, Dynamo's conflict resolution.)*
 - **`remove` is not versioned → needs tombstones.** A delete just drops the key, so a stale replica
