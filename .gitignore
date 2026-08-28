@@ -6,3 +6,9 @@ store.db
 
 # macOS
 .DS_Store
+
+# Reference material — personal copies, NEVER committed or pushed (copyright).
+# Books/papers go under reference/; only its README is tracked.
+*.pdf
+reference/*
+!reference/README.md
