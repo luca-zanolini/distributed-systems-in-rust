@@ -1,3 +1,12 @@
+//! 02 — Networked key-value store (server).
+//!
+//! In CCGR terms (Cachin, Guerraoui & Rodrigues, 2nd ed., 2011): the server and client are
+//! **processes** (§2.1.1) that interact only by exchanging **messages** over a **link**. The TCP
+//! socket realizes a **perfect point-to-point link** (Module 2.3: PL1 reliable delivery, PL2 no
+//! duplication, PL3 no creation) — the OS provides PL1–PL3; we only frame messages with `\n`
+//! (§2.4.7). A client that disconnects is a **crash-stop** fault (§2.2.2); `handle_client`
+//! returning `Result` keeps the server **correct** (fault isolation).
+
 use std::collections::HashMap; // the map that backs the store
 use std::io::Write; // brings write_all() into scope
 use std::io::{BufRead, BufReader}; // buffered reader + its .lines() method

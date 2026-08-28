@@ -108,6 +108,30 @@ consensus-backed, partitioned system — **the same tiny API, wildly different e
 In short: this project is the **"K" and the "V."** The **"distributed"** is the rest of the
 course, and every limit above is a signpost to the next project.
 
+### 6. In the CCGR framework (the book's language)
+
+From here on this repo also speaks the vocabulary of Cachin, Guerraoui & Rodrigues,
+*Introduction to Reliable and Secure Distributed Programming* (2nd ed., 2011) — **"CCGR"**, the
+reference text for the theory. Where `01` sits in its framework:
+
+- **The object is a *register*.** A KV store is a set of **read/write registers** — one per key —
+  the shared-storage abstraction CCGR develops in **Chapter 4**. A register supports two
+  operations, **read** (our `get`) and **write** (our `set`; `remove` writes a distinguished
+  "empty" value). This project implements the **single-process, failure-free case**: with no
+  concurrency and no faults, every read returns the last value written, so the register is
+  trivially **atomic / linearizable** (CCGR §4.1.3, *completeness and precedence*). The hard part
+  of Chapter 4 — keeping a register atomic once it is **replicated** across processes that can
+  fail — is exactly what project `03` begins, via **quorums**.
+- **Persistence is *stable storage*.** Our `save`/`load` to `store.db` is CCGR's **stable
+  storage** (§2.2.4): the `store`/`retrieve` operations a process uses to survive a
+  **crash-recovery** fault and defeat **amnesia** — the loss of volatile state on restart. The
+  book uses exactly this to lift crash-stop algorithms into the **fail-recovery** model (logged
+  links §2.4.5, logged registers §4.5). So `01`'s durability is an early, informal meeting with a
+  concept the later projects make precise.
+- **Failure model: none yet.** One process, no faults — below even the **crash-stop** model
+  (§2.2.2) the networked projects enter. In CCGR's classes of algorithms (§1.5), the distributed
+  story starts at `02`.
+
 ---
 
 ## Run
@@ -159,6 +183,12 @@ free; and that changing a serialization format is a real migration problem.
 
 The most important papers behind this topic. This project is a single-node toy; these are the
 systems and results it grows toward.
+
+**Course reference text (the theory spine for the whole repo)**
+- Christian Cachin, Rachid Guerraoui & Luís Rodrigues, *Introduction to Reliable and Secure
+  Distributed Programming*, 2nd ed., Springer, 2011. The text this repo's theory is aligned to.
+  For `01`: **stable storage** and the crash-recovery model (§2.2.4), and **registers** as the
+  shared-storage abstraction (Ch. 4). ISBN 978-3-642-15259-7.
 
 **Single-node storage engines**
 - Justin Sheehy & David Smith, *Bitcask: A Log-Structured Hash Table for Fast Key/Value Data*,

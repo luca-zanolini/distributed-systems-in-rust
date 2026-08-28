@@ -94,6 +94,43 @@ you understand the shape of most backend infrastructure.
 
 Each limit is a signpost to a later project.
 
+### 6. In the CCGR framework (the book's language)
+
+In the vocabulary of Cachin, Guerraoui & Rodrigues (*Introduction to Reliable and Secure
+Distributed Programming*, 2nd ed., 2011 — **"CCGR"**), this project builds the book's two most
+basic abstractions: **processes** and **links**.
+
+- **Processes and messages (§2.1.1).** The server and the client are **processes**; they share no
+  memory and interact *only* by exchanging **messages** over a **link**. Our `set k v` → `OK` is
+  one such message exchange.
+- **The link is a *perfect point-to-point link* (Module 2.3), and TCP implements it.** CCGR builds
+  reliable communication as a tower — **fair-loss → stubborn → perfect** links (§2.4.2–2.4.4) —
+  where *perfect links* guarantee **PL1 reliable delivery**, **PL2 no duplication**, and **PL3 no
+  creation** (nothing is delivered unless it was sent). The book notes (§2.4.7) that this is
+  *"often found in standard transport-level protocols such as TCP … and need not be
+  reimplemented."* That is exactly our stance: we **assume perfect links** and let **TCP + the
+  OS** provide PL1–PL3 (retransmission = the stubborn layer; dedup/ordering = the perfect layer).
+  Our only protocol job is **framing** (`\n`), because TCP delivers a *byte stream*, not messages.
+  - 🎓 *Teaching idea:* say the assumption out loud — "this server assumes **Module 2.3**." When
+    `03+` goes multi-node and we add **retries, sequence numbers, and idempotency**, we are
+    re-deriving the stubborn→perfect properties *at the application layer*, because end-to-end a
+    single TCP connection no longer spans the whole system.
+- **Failure model: crash-stop (§2.2.2).** A client that vanishes — EOF, RST, broken pipe — is a
+  process that **crashed**: in CCGR terms it becomes **faulty**, while the server stays **correct**
+  (it keeps taking steps). `handle_client` returning `Result`, with `main` logging and continuing,
+  is precisely **tolerating a crash fault** of a client. Crash-stop is the book's default model,
+  and it is ours here too.
+- **Safety vs liveness (§2.1.3).** The service's guarantees split the CCGR way: *"a reply is
+  returned only for a command actually sent, and reflects a real store operation"* is a **safety**
+  property (nothing bad ever happens — cf. PL3 *no creation*); *"every command eventually receives
+  a reply"* is a **liveness** property (something good eventually happens).
+
+**One honest distinction (important).** Our `Arc<Mutex<Store>>` is **local** mutual exclusion
+*inside one process* — it is **not** CCGR's Chapter 4 "shared memory," which is a *distributed*
+register emulated over message-passing among many processes. In fact the book *assumes* each
+process handles events in a mutually exclusive way (§1.4.1); our `Mutex` is just how we honor that
+assumption on real threads. The distributed shared-memory story starts, for real, in `03`.
+
 ---
 
 ## Run
@@ -131,6 +168,13 @@ parallel.
 ---
 
 ## References
+
+**Course reference text (the theory spine for the whole repo)**
+- Christian Cachin, Rachid Guerraoui & Luís Rodrigues, *Introduction to Reliable and Secure
+  Distributed Programming*, 2nd ed., Springer, 2011. The text this repo's theory is aligned to.
+  For `02`: **processes and messages** (§2.1.1), the **perfect point-to-point links** abstraction
+  that TCP implements (Module 2.3; §2.4.7), and the **crash-stop** failure model (§2.2.2).
+  ISBN 978-3-642-15259-7.
 
 **Client/server & RPC**
 - Andrew Birrell & Bruce Nelson, *Implementing Remote Procedure Calls*, ACM TOCS, 1984. The

@@ -1,3 +1,9 @@
+//! 02 — Networked key-value store (client).
+//!
+//! A client **process** (CCGR §2.1.1) that reaches the server over a **perfect point-to-point
+//! link** (Module 2.3) provided by TCP: it sends each command as a `\n`-framed message and reads
+//! one reply — a request/reply exchange over the link.
+
 use std::io::{BufRead, BufReader, Write};   // read_line/.lines() (BufRead) + write_all (Write)
 use std::net::TcpStream;                    // the client socket
 

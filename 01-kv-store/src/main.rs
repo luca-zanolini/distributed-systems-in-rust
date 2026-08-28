@@ -1,3 +1,11 @@
+//! 01 — Key-value store.
+//!
+//! In the language of the reference text (Cachin, Guerraoui & Rodrigues, *Introduction to
+//! Reliable and Secure Distributed Programming*, 2nd ed., 2011 — "CCGR"): a KV store is a set of
+//! read/write **registers**, one per key (CCGR Ch. 4). This is the single-process, failure-free
+//! case, so the register is trivially atomic. `save`/`load` below is **stable storage**
+//! (CCGR §2.2.4) — what a process uses to survive a crash and recover its state.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
