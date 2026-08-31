@@ -22,8 +22,8 @@ fn main() -> std::io::Result<()> {
     println!("node {me} — peers {peers:?}");
 
     // shared: when did we last hear from each peer?
-    let last_heard: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
-
+    let last_heard: Arc<Mutex<HashMap<String, (Instant, String)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     // heartbeat + monitor thread
     {
         let me = me.clone();
@@ -32,19 +32,15 @@ fn main() -> std::io::Result<()> {
         thread::spawn(move || {
             let timeout = Duration::from_secs(3);
             let mut suspected: HashSet<String> = HashSet::new();
-            let mut current_leader: Option<String> = None;
+            let mut current_status: Option<String> = None;
+            let total = peers.len() + 1;
+            let majority = total / 2 + 1;
+
             loop {
-                // send heartbeats
-                for addr in &peers {
-                    if let Ok(mut s) = TcpStream::connect(addr) {
-                        let _ = writeln!(s, "ping {me}");
-                    }
-                }
-                // monitor heartbeats
                 if let Ok(map) = last_heard.lock() {
                     for addr in &peers {
                         let down = match map.get(addr) {
-                            Some(t) => t.elapsed() > timeout,
+                            Some((t, _)) => t.elapsed() > timeout,
                             None => false,
                         };
                         if down && !suspected.contains(addr) {
@@ -57,20 +53,46 @@ fn main() -> std::io::Result<()> {
                     }
                 }
 
-                // election: the alive node with the lowest PORT is the leader
                 let mut candidates: Vec<String> = vec![me.clone()];
                 for p in &peers {
                     if !suspected.contains(p) {
                         candidates.push(p.clone());
                     }
                 }
-                let leader = candidates.into_iter().min_by_key(|a| port_of(a));
-                                                                               
-                if leader != current_leader {
-                    if let Some(l) = &leader {
-                        println!("LEADER is now {l}");
+                let choice = candidates.into_iter().min_by_key(|a| port_of(a)).unwrap();
+
+                for addr in &peers {
+                    if let Ok(mut s) = TcpStream::connect(addr) {
+                        let _ = writeln!(s, "ping {me} {choice}");
                     }
-                    current_leader = leader;
+                }
+
+                let votes: usize = {
+                    let mut count = if choice == me { 1 } else { 0 };
+                    if let Ok(map) = last_heard.lock() {
+                        for addr in &peers {
+                            if !suspected.contains(addr) {
+                                if let Some((_, vote)) = map.get(addr) {
+                                    if vote == &me {
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    count
+                };
+
+                let status = if votes >= majority {
+                    format!("I AM LEADER ({votes}/{total} votes)")
+                } else if choice == me {
+                    format!("candidate, NO majority ({votes}/{total} votes) — standing down")
+                } else {
+                    format!("voting for {choice}")
+                };
+                if Some(&status) != current_status.as_ref() {
+                    println!("{status}");
+                    current_status = Some(status);
                 }
 
                 thread::sleep(Duration::from_secs(1));
@@ -87,10 +109,12 @@ fn main() -> std::io::Result<()> {
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
                 if reader.read_line(&mut line).is_ok() {
-                    if let Some(sender) = line.strip_prefix("ping ") {
-                        let sender = sender.trim().to_string();
-                        if let Ok(mut map) = last_heard.lock() {
-                            map.insert(sender, Instant::now());
+                    if let Some(rest) = line.strip_prefix("ping ") {
+                        let mut parts = rest.split_whitespace();
+                        if let (Some(sender), Some(vote)) = (parts.next(), parts.next()) {
+                            if let Ok(mut map) = last_heard.lock() {
+                                map.insert(sender.to_string(), (Instant::now(), vote.to_string()));
+                            }
                         }
                     }
                 }
