@@ -1,17 +1,24 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-use std::time::Instant; 
+use std::time::Instant;
 
+// the numeric port of an address like "127.0.0.1:5001" → 5001 (used to ORDER nodes)
+fn port_of(addr: &str) -> u16 {
+    addr.rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(u16::MAX)
+}
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let port = args.get(1).cloned().unwrap_or_else(|| "5000".to_string());
     let peers: Vec<String> = args.iter().skip(2).cloned().collect();
-    let me = format!("127.0.0.1:{port}");   // this node's id = its address (matches peer addrs)
+    let me = format!("127.0.0.1:{port}"); // this node's id = its address (matches peer addrs)
     println!("node {me} — peers {peers:?}");
 
     // shared: when did we last hear from each peer?
@@ -25,10 +32,13 @@ fn main() -> std::io::Result<()> {
         thread::spawn(move || {
             let timeout = Duration::from_secs(3);
             let mut suspected: HashSet<String> = HashSet::new();
+            let mut current_leader: Option<String> = None;
             loop {
                 // send heartbeats
                 for addr in &peers {
-                    if let Ok(mut s) = TcpStream::connect(addr) { let _ = writeln!(s, "ping {me}"); }
+                    if let Ok(mut s) = TcpStream::connect(addr) {
+                        let _ = writeln!(s, "ping {me}");
+                    }
                 }
                 // monitor heartbeats
                 if let Ok(map) = last_heard.lock() {
@@ -45,6 +55,22 @@ fn main() -> std::io::Result<()> {
                             suspected.remove(addr);
                         }
                     }
+                }
+
+                // election: the alive node with the lowest PORT is the leader
+                let mut candidates: Vec<String> = vec![me.clone()];
+                for p in &peers {
+                    if !suspected.contains(p) {
+                        candidates.push(p.clone());
+                    }
+                }
+                let leader = candidates.into_iter().min_by_key(|a| port_of(a));
+                                                                               
+                if leader != current_leader {
+                    if let Some(l) = &leader {
+                        println!("LEADER is now {l}");
+                    }
+                    current_leader = leader;
                 }
 
                 thread::sleep(Duration::from_secs(1));
@@ -73,4 +99,3 @@ fn main() -> std::io::Result<()> {
     }
     Ok(())
 }
-
