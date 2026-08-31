@@ -123,3 +123,25 @@ fn main() -> std::io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_of_extracts_the_port() {
+        assert_eq!(port_of("127.0.0.1:5001"), 5001);
+        assert_eq!(port_of("127.0.0.1:9000"), 9000);
+    }
+
+    #[test]
+    fn port_of_orders_numerically_not_lexically() {
+        // "10000" < "9000" as strings, but 10000 > 9000 as numbers — the whole point of port_of
+        assert!(port_of("127.0.0.1:10000") > port_of("127.0.0.1:9000"));
+    }
+
+    #[test]
+    fn unparsable_address_sorts_last() {
+        assert_eq!(port_of("garbage"), u16::MAX);
+    }
+}
