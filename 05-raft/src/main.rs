@@ -4,30 +4,64 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn port_of(addr: &str) -> u16 {
-    addr.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(u16::MAX)
-}
-
-// RequestVote RPC: ask a peer for its vote. Some((their_term, granted)) or None if unreachable.
-fn request_vote(peer: &str, term: u64, me: &str) -> Option<(u64, bool)> {
-    let mut conn = TcpStream::connect(peer).ok()?;
-    conn.write_all(format!("requestvote {term} {me}\n").as_bytes()).ok()?;
-    let mut reply = String::new();
-    BufReader::new(&conn).read_line(&mut reply).ok()?;
-    match reply.split_whitespace().collect::<Vec<_>>().as_slice() {
-        ["vote", t, granted] => Some((t.parse().ok()?, *granted == "yes")),
-        _ => None,
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Role { Follower, Candidate, Leader }
+enum Role {
+    Follower,
+    Candidate,
+    Leader,
+}
+
+struct Entry {
+    #[allow(dead_code)] // read in Step 2: log matching + the commit-term safety rule
+    term: u64,
+    cmd: String, // the client command, e.g. "set x 1" or "remove x"
+}
 
 struct State {
     term: u64,
     role: Role,
     voted_for: Option<String>,
     last_heard: Instant,
+    log: Vec<Entry>,                               // the replicated command log
+    commit_index: usize,                           // how many entries are committed
+    applied: usize,                                // how many committed entries we've applied to kv
+    kv: std::collections::HashMap<String, String>, // the state machine
+}
+
+fn apply(s: &mut State) {
+    while s.applied < s.commit_index {
+        let cmd = s.log[s.applied].cmd.clone();
+        match cmd.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["set", k, rest @ ..] => {
+                s.kv.insert(k.to_string(), rest.join(" "));
+            }
+            ["remove", k] => {
+                s.kv.remove(*k);
+            }
+            _ => {}
+        }
+        s.applied += 1;
+    }
+}
+
+fn port_of(addr: &str) -> u16 {
+    addr.rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(u16::MAX)
+}
+
+// RequestVote RPC: ask a peer for its vote. Some((their_term, granted)) or None if unreachable.
+fn request_vote(peer: &str, term: u64, me: &str) -> Option<(u64, bool)> {
+    let mut conn = TcpStream::connect(peer).ok()?;
+    conn.write_all(format!("requestvote {term} {me}\n").as_bytes())
+        .ok()?;
+    let mut reply = String::new();
+    BufReader::new(&conn).read_line(&mut reply).ok()?;
+    match reply.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["vote", t, granted] => Some((t.parse().ok()?, *granted == "yes")),
+        _ => None,
+    }
 }
 
 fn main() {
@@ -41,7 +75,14 @@ fn main() {
     println!("node {me} — peers {peers:?} — timeout {election_timeout:?}, majority {majority}");
 
     let state = Arc::new(Mutex::new(State {
-        term: 0, role: Role::Follower, voted_for: None, last_heard: Instant::now(),
+        term: 0,
+        role: Role::Follower,
+        voted_for: None,
+        last_heard: Instant::now(),
+        log: Vec::new(),
+        commit_index: 0,
+        applied: 0,
+        kv: std::collections::HashMap::new(),
     }));
 
     // ---- election + heartbeat thread ----
@@ -53,19 +94,29 @@ fn main() {
             thread::sleep(Duration::from_millis(200));
 
             // A leader just sends heartbeats (which reset followers' election timers).
-            let (role, term) = { let s = state.lock().unwrap(); (s.role, s.term) };
+            let (role, term) = {
+                let s = state.lock().unwrap();
+                (s.role, s.term)
+            };
             if role == Role::Leader {
                 for peer in &peers {
                     if let Ok(mut c) = TcpStream::connect(peer) {
                         let _ = writeln!(c, "heartbeat {term} {me}");
                     }
                 }
+                if majority == 1 {
+                    let mut s = state.lock().unwrap();
+                    s.commit_index = s.log.len();
+                    apply(&mut s);
+                }
                 continue;
             }
 
             // Follower/candidate: has the leader gone silent past our timeout?
             let timed_out = { state.lock().unwrap().last_heard.elapsed() > election_timeout };
-            if !timed_out { continue; }
+            if !timed_out {
+                continue;
+            }
 
             // Become a candidate for a NEW term (short lock), snapshot the term.
             let term = {
@@ -77,7 +128,7 @@ fn main() {
                 println!("term {}: {me} → CANDIDATE (requesting votes)", s.term);
                 s.term
             };
-            
+
             let total = peers.len() + 1; // including self
             let votes: usize = {
                 let mut count = 1; // self-vote
@@ -89,7 +140,7 @@ fn main() {
                     }
                 }
                 count
-            };  
+            };
 
             // Won? Re-lock and confirm we're STILL a candidate in the SAME term.
             let mut s = state.lock().unwrap();
@@ -103,10 +154,15 @@ fn main() {
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).unwrap();
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
-        let mut writer = match stream.try_clone() { Ok(w) => w, Err(_) => continue };
+        let mut writer = match stream.try_clone() {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        if reader.read_line(&mut line).is_err() { continue; }
+        if reader.read_line(&mut line).is_err() {
+            continue;
+        }
 
         match line.split_whitespace().collect::<Vec<_>>().as_slice() {
             ["requestvote", term, candidate] => {
@@ -120,23 +176,56 @@ fn main() {
                         s.voted_for = None;
                     }
                     let granted = cand_term == s.term
-                        && (s.voted_for.is_none() || s.voted_for.as_deref() == Some(candidate.as_str()));
+                        && (s.voted_for.is_none()
+                            || s.voted_for.as_deref() == Some(candidate.as_str()));
                     if granted {
                         s.voted_for = Some(candidate.clone());
                         s.last_heard = Instant::now();
                     }
-                    (s.term, granted)   
+                    (s.term, granted)
                 };
-                let _ = writeln!(writer, "vote {my_term} {}", if granted { "yes" } else { "no" });
+                let _ = writeln!(
+                    writer,
+                    "vote {my_term} {}",
+                    if granted { "yes" } else { "no" }
+                );
             }
             ["heartbeat", term, _leader] => {
                 let hb_term: u64 = term.parse().unwrap_or(0);
                 let mut s = state.lock().unwrap();
                 if hb_term >= s.term {
-                    if hb_term > s.term { s.voted_for = None; }
+                    if hb_term > s.term {
+                        s.voted_for = None;
+                    }
                     s.term = hb_term;
                     s.role = Role::Follower;
                     s.last_heard = Instant::now(); // a live leader → reset our election clock
+                }
+            }
+            ["set", ..] | ["remove", ..] => {
+                let mut s = state.lock().unwrap();
+                if s.role == Role::Leader {
+                    let term = s.term; // read first (ends the borrow) — the guard Derefs the WHOLE State
+                    s.log.push(Entry {
+                        term,
+                        cmd: line.trim().to_string(),
+                    });
+                    let _ = writeln!(writer, "OK (log index {})", s.log.len());
+                } else {
+                    let _ = writeln!(writer, "NOT LEADER");
+                }
+            }
+            ["get", key] => {
+                let mut s = state.lock().unwrap();
+                if s.role == Role::Leader {
+                    apply(&mut s);
+                    let value =
+                        s.kv.get(*key)
+                            .cloned()
+                            .unwrap_or_else(|| "(nil)".to_string());
+                    let _ = writeln!(writer, "{value}");
+                } else {
+                    let _ = writeln!(writer, "NOT LEADER");
                 }
             }
             _ => {}
