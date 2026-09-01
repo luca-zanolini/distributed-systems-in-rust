@@ -91,7 +91,37 @@ register correct, now applied to leadership — and it is the core idea of **Raf
   is the weakest failure detector for consensus** (Chandra–Hadzilacos–Toueg). `04` builds Ω; `05`
   (Raft) will use it.
 
-### 7. How the code reflects the theory — and where it stops
+### 7. Failure detectors vs. timing models — two lenses on the same thing
+
+You can reason about what a distributed system can *solve* in **two equivalent ways**: directly via
+the **timing model** (synchronous / partially synchronous / asynchronous), or via a **failure
+detector** (P, ◇P, Ω). A failure detector is really just *synchrony packaged as an oracle* — it lets
+you design an algorithm against **axiomatic properties** (no clocks, no timeouts in the proof) and
+implement the detector *separately* from whatever timing the system actually has (CCGR §2.6.1).
+
+| Timing model | Detector you can implement | Consensus? |
+|---|---|---|
+| **Synchronous** | **P** — *perfect*, never wrong (strong accuracy) | yes — even fail-stop, any `f < N` |
+| **Partially synchronous** (GST) | **◇P / ◇Ω** — *eventually* accurate | yes — with a **majority**, `f < N/2` (Paxos, Raft) |
+| **Asynchronous** | none strong enough | **no — FLP** |
+
+- **Perfect FD ≈ synchrony.** With known delay bounds a timeout *never* misfires → strong accuracy.
+  `P` is exactly the crash-detection power a synchronous system buys you.
+- **◇Ω ≈ partial synchrony + GST.** This is DLS's *eventually-synchronous* model: before the
+  (unknown) **Global Stabilization Time**, timeouts can be wrong — false suspicions, even two
+  temporary leaders; *after* GST, delays are bounded, timeouts stop misfiring → **eventual accuracy**
+  → a single stable leader eventually emerges and stays. ◇Ω *is* "eventually one correct leader."
+- **Asynchrony.** You can't implement even ◇Ω deterministically (no eventual bound to lean on) — the
+  failure-detector face of **FLP**.
+
+The two lenses meet in one theorem: **Ω is the *weakest* failure detector that solves consensus**
+(Chandra–Hadzilacos–Toueg, 1996). So *consensus is solvable ⟺ you can implement Ω ⟺ you have at
+least partial synchrony.* This project lives in the **◇P / ◇Ω** regime; Raft (`05`) assumes the same.
+
+> 🎓 Slogan: **synchrony → P; partial synchrony → ◇Ω; asynchrony → nothing (FLP).** Failure detectors
+> are synchrony, packaged as an oracle.
+
+### 8. How the code reflects the theory — and where it stops
 
 | Theory | In this code |
 |---|---|
