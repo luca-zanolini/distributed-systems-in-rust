@@ -12,7 +12,7 @@ enum Role {
 }
 
 struct Entry {
-    term: u64, // used by the commit-term safety rule (Raft Fig. 8) and log up-to-date checks
+    term: u64,   // used by the commit-term safety rule (Raft Fig. 8) and log up-to-date checks
     cmd: String, // the client command, e.g. "set x 1" or "remove x"
 }
 
@@ -112,6 +112,38 @@ fn append_entries(
     }
 }
 
+fn persist(s: &State, path: &str) {
+    let voted = s.voted_for.as_deref().unwrap_or("-");
+    let data = format!(
+        "term {}\nvoted {}\ncommit {}\nlog {}\n",
+        s.term,
+        voted,
+        s.commit_index,
+        serialize_log(&s.log)
+    );
+    if let Ok(mut f) = std::fs::File::create(path) {
+        let _ = f.write_all(data.as_bytes());
+        let _ = f.sync_all(); // fsync — durable to disk BEFORE we return (a crash can't lose it)
+    }
+}
+
+fn load(path: &str) -> Option<(u64, Option<String>, usize, Vec<Entry>)> {
+    let data = std::fs::read_to_string(path).ok()?;
+    let (mut term, mut voted, mut commit, mut log) = (0u64, None, 0usize, Vec::new());
+    for line in data.lines() {
+        if let Some(v) = line.strip_prefix("term ") {
+            term = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("voted ") {
+            voted = (v != "-").then(|| v.to_string());
+        } else if let Some(v) = line.strip_prefix("commit ") {
+            commit = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("log ") {
+            log = parse_entries(v);
+        }
+    }
+    Some((term, voted, commit, log))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let port = args.get(1).cloned().unwrap_or_else(|| "6000".to_string());
@@ -122,22 +154,33 @@ fn main() {
     let election_timeout = Duration::from_millis(1500 + (port_of(&me) as u64 % 7) * 300);
     println!("node {me} — peers {peers:?} — timeout {election_timeout:?}, majority {majority}");
 
-    let state = Arc::new(Mutex::new(State {
-        term: 0,
+    let state_path = format!("raft-{port}.state");
+    let (t0, v0, c0, log0) = load(&state_path).unwrap_or((0, None, 0, Vec::new()));
+    let mut initial = State {
+        term: t0,
         role: Role::Follower,
-        voted_for: None,
+        voted_for: v0,
         last_heard: Instant::now(),
-        log: Vec::new(),
-        commit_index: 0,
+        log: log0,
+        commit_index: c0,
         applied: 0,
         kv: std::collections::HashMap::new(),
-    }));
+    };
+    apply(&mut initial); // rebuild kv by replaying committed entries
+    if t0 > 0 || !initial.log.is_empty() {
+        println!(
+            "recovered: term {t0}, {} log entries, commit {c0}",
+            initial.log.len()
+        );
+    }
+    let state = Arc::new(Mutex::new(initial));
 
     // ---- election + heartbeat thread ----
     {
         let me = me.clone();
         let peers = peers.clone();
         let state = Arc::clone(&state);
+        let state_path = state_path.clone(); // the thread gets its own copy of the path
         thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_millis(200));
@@ -167,6 +210,7 @@ fn main() {
                     if agreed > s.commit_index && agreed > 0 && s.log[agreed - 1].term == term {
                         s.commit_index = agreed;
                     }
+                    persist(&s, &state_path);
                     apply(&mut s);
                     continue;
                 }
@@ -184,6 +228,7 @@ fn main() {
                     s.role = Role::Candidate;
                     s.voted_for = Some(me.clone());
                     s.last_heard = Instant::now();
+                    persist(&s, &state_path);
                     println!("term {}: {me} → CANDIDATE (requesting votes)", s.term);
                     (
                         s.term,
@@ -255,6 +300,7 @@ fn main() {
                         s.voted_for = Some(candidate.clone());
                         s.last_heard = Instant::now();
                     }
+                    persist(&s, &state_path);
                     (s.term, granted)
                 };
                 let _ = writeln!(
@@ -280,6 +326,7 @@ fn main() {
                         s.log = parse_entries(entries); // adopt the leader's log (Step 2 simplification)
                         s.commit_index = leader_commit.min(s.log.len());
                         apply(&mut s);
+                        persist(&s, &state_path);
                     }
                     (s.term, s.log.len())
                 };
@@ -293,6 +340,7 @@ fn main() {
                         term,
                         cmd: line.trim().to_string(),
                     });
+                    persist(&s, &state_path);
                     let _ = writeln!(writer, "OK (log index {})", s.log.len());
                 } else {
                     let _ = writeln!(writer, "NOT LEADER");
