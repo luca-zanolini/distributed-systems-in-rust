@@ -47,6 +47,17 @@ Three ways to circumvent it — you must weaken the async model somehow:
 2. **Randomization** (coin flips break the adversary's grip) — Ben-Or 1983; randomized BFT.
 3. **Failure detectors** (an oracle about crashes) — Chandra–Toueg 1996.
 
+**Fault-model caveat.** Partial synchrony and randomization are **fault-agnostic** — they weaken the
+async adversary *itself*, so they work for **crash *and* Byzantine** (DLS covers Byzantine partial
+synchrony; Ben-Or has a Byzantine variant). **Failure detectors, however, are a crash-fault tool
+only:** a Byzantine process is *up and lying*, not stopped, so it **evades detection** — a malicious
+node behaves correctly toward the detector and strikes elsewhere (CCGR §2.6.1 explicitly declines FDs
+for Byzantine). The missing info for crash-FLP is *"is it alive?"* (a FD supplies it); for Byzantine
+it's *"is it honest?"* — undetectable, so you don't detect it, you handle it **structurally**: bigger
+quorums (`3f+1`, honest intersection) **+ cryptographic signatures**. The *leader-election* role does
+survive into BFT, but only as a **specialized** Byzantine leader-detector / **view-change** (CCGR
+§2.6.6) — driven by timeouts + algorithm-specific monitoring, **not** a generic crash detector.
+
 These three are the same escape wearing different clothes (see §4).
 
 ---
