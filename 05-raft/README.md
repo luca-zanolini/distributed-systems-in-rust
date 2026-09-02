@@ -97,6 +97,7 @@ values are imposed and locked through **majority quorums** (§2.7.3). A Raft *te
 | apply to a state machine | `apply()` replays committed entries into `kv` |
 | Leader Completeness | the up-to-date-log vote restriction |
 | Figure-8 safety | commit only when `log[agreed-1].term == currentTerm` |
+| **crash-recovery persistence** | `persist()` fsyncs `term`/`votedFor`/`log`/`commit` **before every reply**; `load()` + replay on restart |
 
 **Honest limits — the syllabus beyond this project (each a signpost):**
 
@@ -105,9 +106,11 @@ values are imposed and locked through **majority quorums** (§2.7.3). A Raft *te
   wasteful. Real Raft uses **`prevLogIndex`/`prevLogTerm`** + per-follower **`nextIndex`** to
   replicate *incrementally* and reconcile a divergent follower by backing up. *(An optimization, not
   a safety gap.)*
-- **No persistence.** `term`, `votedFor`, and the `log` live only in memory; real Raft **fsyncs**
-  them before responding, so a node survives a restart without violating safety. *(→ stable storage,
-  as in `01`/`03`.)*
+- **Persistence: ✅ implemented.** `term`, `votedFor`, `log`, and `commit` are **fsync'd to
+  `raft-<port>.state` before every reply**, and reloaded (with the log replayed into the KV) on
+  restart — so a node survives a crash with **no double-vote and no lost committed entry**. This is
+  CCGR's **crash-recovery** model backed by **stable storage** (§2.2.4), as in `01`/`03`. (See the
+  `persistence.py` demo: kill the *whole* cluster, restart, data survives.)
 - **No log compaction / snapshots.** The log grows forever. Real Raft **snapshots** the state machine
   and truncates. *(→ snapshotting.)*
 - **Static membership.** No add/remove-node. Real Raft has a **joint-consensus** membership-change
@@ -154,6 +157,7 @@ serving the same data.
 |---|---|
 | `election.py` | a 3-node cluster elects one leader per term; kill it → a new leader in a higher term |
 | `replication_failover.py` | write to the leader, **kill it**, and the data is served by the new leader (committed on a majority → survives) |
+| `persistence.py` | write, **kill the *whole* cluster**, restart → the data survives (each node reloads `term`/`votedFor`/`log`/`commit` from disk) |
 
 ## Design & notable implementation details
 
