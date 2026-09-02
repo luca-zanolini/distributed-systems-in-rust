@@ -41,33 +41,32 @@ The intuition: with no timing bounds you can't distinguish a **crashed** process
 **slow** one, so any protocol can be forced (by an adversarial scheduler) into an infinite run that
 never decides. Crucially, FLP kills **liveness**, not safety — you can't be *stuck-free*, not *wrong*.
 
-Three ways to circumvent it — you must weaken the async model somehow:
+Circumventing it means weakening the async model — and there are really **two fundamental escapes**:
 
-1. **Partial synchrony** (add *some* timing) — Paxos, Raft, PBFT.
-2. **Randomization** (coin flips break the adversary's grip) — Ben-Or 1983; randomized BFT.
-3. **Failure detectors** (an oracle about crashes) — Chandra–Toueg 1996.
+**① Add a little *timing* — partial synchrony.** Delay bounds that hold *eventually* (after GST). You
+reach this power **two ways**, the same escape in different clothes:
+- *directly*, with **timeouts** written into the protocol — **Paxos, Raft, PBFT**; or
+- through the **failure-detector** interface (◇P / Ω — Chandra–Toueg 1996): prove the algorithm
+  correct against the detector's *timeless* axioms, and implement the detector *from* timeouts.
 
-**Fault-model caveat.** Partial synchrony and randomization are **fault-agnostic** — they weaken the
-async adversary *itself*, so they work for **crash *and* Byzantine** (DLS covers Byzantine partial
-synchrony; Ben-Or has a Byzantine variant). **Failure detectors, however, are a crash-fault tool
-only:** a Byzantine process is *up and lying*, not stopped, so it **evades detection** — a malicious
-node behaves correctly toward the detector and strikes elsewhere (CCGR §2.6.1 explicitly declines FDs
-for Byzantine). The missing info for crash-FLP is *"is it alive?"* (a FD supplies it); for Byzantine
-it's *"is it honest?"* — undetectable, so you don't detect it, you handle it **structurally**: bigger
-quorums (`3f+1`, honest intersection) **+ cryptographic signatures**. The *leader-election* role does
-survive into BFT, but only as a **specialized** Byzantine leader-detector / **view-change** (CCGR
-§2.6.6) — driven by timeouts + algorithm-specific monitoring, **not** a generic crash detector.
+> A failure detector is **not** a way to beat asynchrony — ◇P/Ω are **unimplementable** in pure async
+> (that's FLP again). It is the clean *interface* to this escape; the **CHT theorem** (§4) makes it
+> exact: *Ω implementable ⟺ partial synchrony*. Its payoff is **modularity** (CCGR §2.6.1) — a
+> clock-free safety proof, with all the timing quarantined inside Ω's implementation.
 
-**Really *two* escapes, not three.** A failure detector does **not** circumvent asynchrony — you
-*cannot implement* ◇P/Ω in a truly asynchronous system (if you could, you'd solve consensus in async
-and contradict FLP). A detector is the **abstract interface to the partial-synchrony escape**: you
-design against Ω's *timeless* axioms and implement Ω **from timeouts**. So the fundamental resources
-are two — **a little timing** (partial synchrony, accessed *either* by direct timeouts *or* through
-the failure-detector interface) or **a little luck** (randomization, the only one that truly keeps
-full asynchrony). Refuse both and FLP stands. The reason to still use detectors is **modularity**
-(CCGR §2.6.1): a clock-free safety proof against Ω, with the timing quarantined in Ω's
-implementation. The **CHT theorem** (§4) makes the identity exact — *Ω implementable ⟺ partial
-synchrony* — so the FD lens and the timing lens are the **same** escape wearing different clothes.
+**② Add a little *luck* — randomization.** Coin flips break the adversary's grip; this is the **only**
+escape that keeps *full* asynchrony — **Ben-Or 1983**; randomized BFT (HoneyBadgerBFT).
+
+Refuse both, and FLP stands.
+
+**Fault-model note.** Both escapes are **fault-agnostic** at the *model* level (DLS gives Byzantine
+partial synchrony; Ben-Or has a Byzantine variant) — **but the failure-detector *packaging* is
+crash-only.** A Byzantine process is *up and lying*, not stopped, so it **evades detection** (a
+malicious node behaves correctly toward the detector and strikes elsewhere — CCGR §2.6.1 declines FDs
+for Byzantine). There, *"is it honest?"* is undetectable; you replace detection with **bigger quorums
+(`3f+1`, honest intersection) + signatures**, and the leader-election role survives only as a
+*specialized* **view-change** (CCGR §2.6.6) — driven by timeouts + algorithm-specific monitoring, not
+a generic crash detector.
 
 ---
 
