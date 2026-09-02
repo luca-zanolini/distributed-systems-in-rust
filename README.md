@@ -14,6 +14,7 @@ Each folder is an independent Cargo project you can build and run on its own.
 | 02 | [`02-networked-kv-store`](02-networked-kv-store) | Concurrent TCP client/server over the store — request/response, newline framing, fault isolation, `Arc<Mutex>` concurrency. ✅ |
 | 03 | [`03-replicated-kv-store`](03-replicated-kv-store) | Replication across nodes → a fault-tolerant **quorum register**: sync/async replication, the CAP trade-off, quorum reads & writes, crash-recovery catch-up. The (1, N) Majority-Voting register; the rung before consensus. ✅ |
 | 04 | [`04-leader-election`](04-leader-election) | Failure detection & leader election: heartbeats, timeouts (◇P), and **majority-vote** election so a cluster survives losing its leader — the failover `03` needs, and the building block under Raft. ✅ |
+| 05 | [`05-raft`](05-raft) | **Raft consensus**: terms, leader election, a replicated **log**, majority commit, and the safety rules (leader completeness + Figure-8) — data survives leader failover. Fuses `03`+`04` into one algorithm. Includes [**CONSENSUS.md**](05-raft/CONSENSUS.md), a full theory map (FLP, timing, crash vs BFT, quorums, 2PC). ✅ |
 
 ## Author
 
