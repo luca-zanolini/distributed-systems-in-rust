@@ -58,7 +58,16 @@ quorums (`3f+1`, honest intersection) **+ cryptographic signatures**. The *leade
 survive into BFT, but only as a **specialized** Byzantine leader-detector / **view-change** (CCGR
 §2.6.6) — driven by timeouts + algorithm-specific monitoring, **not** a generic crash detector.
 
-These three are the same escape wearing different clothes (see §4).
+**Really *two* escapes, not three.** A failure detector does **not** circumvent asynchrony — you
+*cannot implement* ◇P/Ω in a truly asynchronous system (if you could, you'd solve consensus in async
+and contradict FLP). A detector is the **abstract interface to the partial-synchrony escape**: you
+design against Ω's *timeless* axioms and implement Ω **from timeouts**. So the fundamental resources
+are two — **a little timing** (partial synchrony, accessed *either* by direct timeouts *or* through
+the failure-detector interface) or **a little luck** (randomization, the only one that truly keeps
+full asynchrony). Refuse both and FLP stands. The reason to still use detectors is **modularity**
+(CCGR §2.6.1): a clock-free safety proof against Ω, with the timing quarantined in Ω's
+implementation. The **CHT theorem** (§4) makes the identity exact — *Ω implementable ⟺ partial
+synchrony* — so the FD lens and the timing lens are the **same** escape wearing different clothes.
 
 ---
 
@@ -171,6 +180,31 @@ replicate/commit** a value. What differs is the number of rounds and the quorum.
 > The extra Byzantine round and the bigger quorum are the *same* fact from two angles: you can't
 > trust a single message, so you need one more round of cross-checking and one more slice of the
 > cluster in every quorum.
+
+### Leader election *detects*; quorums *decide* (and the view-change welds them)
+
+Leader election / leader-detection only ever buys **liveness** — it points at a leader so the group
+can *make progress*, and it may be **wrong** (suspect a good leader, tolerate a slow bad one) without
+ever breaking correctness. **Safety is a separate guarantee**, carried by the **quorums** (and, in
+BFT, **signatures**) — never by the detector.
+
+- **Crash (Raft):** cleanly separable. Ω picks a leader (liveness); the majority quorum + the
+  up-to-date-log restriction keep it safe (safety). A wrong Ω only costs an extra election.
+- **Byzantine (PBFT / HotStuff):** the two are **welded together in the view-change**, which must at
+  once (a) rotate away from a suspected/faulty leader *and* (b) **preserve every committed value**
+  across the change — and (b) is the hard part. The challenges:
+  - **Trust no one.** The old leader may have equivocated; any replica may lie. The new leader must
+    justify its starting point from a **quorum of *signed* certificates**, not any single report.
+  - **Preserve commits across the handoff.** If *any* honest node committed `v` in the old view, the
+    new leader is *forced* to re-propose something consistent with `v`. The commit phase +
+    prepare/commit certificates exist precisely to make this **provable** despite a lying predecessor.
+  - **Cost & correctness.** Classic PBFT view-change is `O(n²)`–`O(n³)` and notoriously subtle;
+    **HotStuff** re-engineered it to be **linear** (threshold signatures + a uniform 3-chain rule) —
+    proof of how hard "just change the leader" really is.
+
+> Slogan: **detectors/leaders provide *liveness*; quorums provide *safety*.** In crash consensus the
+> two live in separate boxes; in BFT the **view-change** must deliver both at once — which is why it
+> is the single hardest, most bug-prone piece of every Byzantine protocol.
 
 ---
 
