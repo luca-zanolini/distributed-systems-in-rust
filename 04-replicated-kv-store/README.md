@@ -1,4 +1,4 @@
-# Module 03 — Replication and Quorums: The (1, N) Regular Register
+# Module 04 — Replication and Quorums: The (1, N) Regular Register
 
 *Part of **Concurrent and Distributed Systems in Rust** ([course home](../)). Reference text:
 **CCGR** (Cachin, Guerraoui & Rodrigues, 2nd ed., 2011). Prerequisites:
@@ -13,7 +13,7 @@ module demonstrates — experimentally, not only in statement — the tension be
 availability formalized by the **CAP theorem**, and the **crash-recovery** model with state
 transfer. The register this module completes is the strongest object obtainable *without*
 agreement; the questions it provably leaves open (who is the writer? who succeeds a failed
-writer? what order do concurrent writes take?) motivate Modules 04 and 05.
+writer? what order do concurrent writes take?) motivate Modules 05 and 07.
 
 ---
 
@@ -64,7 +64,7 @@ consensus-backed replication (etcd, ZooKeeper, Spanner, CockroachDB), and log-sh
   rejoin via state transfer.
 - **Timing.** Asynchronous. No timing assumption is needed: the register's safety and liveness
   hold in a fully asynchronous system, which is precisely why registers are obtainable "below"
-  the consensus boundary drawn by FLP (see [CONSENSUS.md](../05-raft/CONSENSUS.md)).
+  the consensus boundary drawn by FLP (see [CONSENSUS.md](../07-raft/CONSENSUS.md)).
 
 ## 3. The abstraction: a (1, N) regular register
 
@@ -125,7 +125,7 @@ repairs. The sequence itself is the pedagogy: it retraces the design space of re
 | M1 | asynchronous primary→backup forwarding | primary acknowledges before the backup confirms; copies can silently diverge |
 | M2 | synchronous replication (primary waits for the backup's ack) | if the backup is down, *every* write fails: consistency purchased with availability — the CAP trade-off, observed directly |
 | M3 | fan-out to `N` backups, wait for **all** | one crashed backup blocks all writes: more replicas *reduced* availability |
-| M4 | **quorum writes** (majority of acks) | a stale minority always exists; a write that fails its quorum is still applied locally (no rollback — a foreshadowing of atomic commit, Module 06) |
+| M4 | **quorum writes** (majority of acks) | a stale minority always exists; a write that fails its quorum is still applied locally (no rollback — a foreshadowing of atomic commit, Module 08) |
 | M5 | crash-recovery by **state transfer** (`dump` snapshot on restart) | reads still consult one node, so a recovering or bypassed node can serve stale data |
 | M6 | **quorum reads** with timestamps (the complete register) | the remaining questions — writer failover, concurrent writers, all-or-nothing writes — are not answerable by quorums alone |
 
@@ -144,7 +144,7 @@ adds nothing. Quorum reads become load-bearing exactly when the *reading coordin
 stale*: after a failover (a replica that missed the last write takes over as primary), or when
 any node may coordinate reads (the configuration of experiment (iii)). This is why the module
 builds the general read path even though its default deployment does not strictly require it —
-and why Module 04 (failover) is what gives it force.
+and why Module 05 (failover) is what gives it force.
 
 ## 6. From regular to atomic
 
@@ -177,20 +177,20 @@ Wire protocol (newline-framed): `set k v` / `get k` / `remove k` (client);
 ## 8. Limitations and outlook
 
 - **No failover.** The primary is fixed; its crash halts writes permanently. Electing a
-  replacement requires the cluster to *agree* on one — leader election. *(→ Module 04.)*
+  replacement requires the cluster to *agree* on one — leader election. *(→ Module 05.)*
 - **Single writer.** Multiple writers need timestamp pairs (rank, counter) or vector clocks, and
   a rule for concurrent-write resolution. *(→ CCGR §4.4; Dynamo's sibling design.)*
 - **Deletion is not versioned.** `remove` drops the key outright, so a stale replica can
   *resurrect* it through a later read quorum; correct deletion writes a **tombstone** `(ts, ⊥)`.
   *(→ Exercise 2.)*
 - **Snapshot catch-up races with writes.** A write arriving during `dump` transfer can be missed;
-  log-based catch-up (snapshot + log suffix) closes the race. *(→ Module 05's log.)*
+  log-based catch-up (snapshot + log suffix) closes the race. *(→ Module 07's log.)*
 - **No stable storage.** A node acknowledges writes held only in memory; a crash after ack loses
   them. Durable acknowledgment requires logging to stable storage first. *(→ CCGR §4.5;
-  Modules 05–06.)*
+  Modules 07–08.)*
 - **Regular, not atomic.** No read-impose. *(→ Exercise 3.)*
 - **No agreement.** Ordering concurrent operations, all-or-nothing multi-node writes, and
-  writer succession all require consensus or atomic commit. *(→ Modules 04–06.)*
+  writer succession all require consensus or atomic commit. *(→ Modules 05–08.)*
 
 ## 9. Exercises
 
@@ -259,5 +259,5 @@ Interact via the bundled client (`cargo run --bin client`); restart a crashed no
 drive the three experiments of §5 against real sockets.
 
 ---
-*[Course home](../) · Previous: [Module 02](../02-networked-kv-store/) · Next:
-[Module 04 — Failure Detection and Leader Election](../04-leader-election/)*
+*[Course home](../) · Previous: [Module 03 (planned)](../03-shared-memory-concurrency/) · Next:
+[Module 05 — Failure Detection and Leader Election](../05-leader-election/)*

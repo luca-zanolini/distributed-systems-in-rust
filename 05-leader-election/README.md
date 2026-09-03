@@ -1,8 +1,8 @@
-# Module 04 — Failure Detection and Leader Election
+# Module 05 — Failure Detection and Leader Election
 
 *Part of **Concurrent and Distributed Systems in Rust** ([course home](../)). Reference text:
 **CCGR** (Cachin, Guerraoui & Rodrigues, 2nd ed., 2011). Prerequisites:
-[Module 02](../02-networked-kv-store/), [Module 03](../03-replicated-kv-store/).*
+[Module 02](../02-networked-kv-store/), [Module 04](../04-replicated-kv-store/).*
 
 **Abstract.** This module builds a cluster that detects the loss of its leader and elects a
 replacement by majority vote, with no central authority. It introduces **failure detectors**
@@ -11,9 +11,9 @@ and timeouts — and **leader election**, culminating in the eventual leader abs
 Two theoretical points carry the module: first, that under partial synchrony failure detection
 can only ever be *eventually* accurate, because a slow process is indistinguishable from a
 crashed one; second, that a **majority-vote** gate — the same quorum-intersection argument as
-Module 03 — is what prevents two leaders from coexisting (*split-brain*). The module supplies
-exactly the failover capability whose absence limited Module 03, and it constructs the oracle
-(Ω) under which Module 05's consensus algorithm is proved live.
+Module 04 — is what prevents two leaders from coexisting (*split-brain*). The module supplies
+exactly the failover capability whose absence limited Module 04, and it constructs the oracle
+(Ω) under which Module 07's consensus algorithm is proved live.
 
 ---
 
@@ -37,7 +37,7 @@ After completing this module, the reader should be able to:
 ## 1. Motivation
 
 Many distributed protocols require a single process to be *in charge* for progress: a primary
-ordering writes (Module 03), a coordinator driving a commit (Module 06), a sequencer, a lock
+ordering writes (Module 04), a coordinator driving a commit (Module 08), a sequencer, a lock
 service. A fixed leader is simple but mortal; when it crashes, the system must do two things
 **by itself**:
 
@@ -58,7 +58,7 @@ Kafka's controller, gossip-based membership (SWIM; Consul's Serf) are all instan
   correct process; the election tolerates this.)
 - **Links.** Heartbeats are sent best-effort over per-message TCP connections; a lost heartbeat
   is compensated by the next one. The abstraction actually relied on is closer to CCGR's
-  **fair-loss links** than to the perfect links of Modules 02–03 — deliberately, since the
+  **fair-loss links** than to the perfect links of Modules 02 and 04 — deliberately, since the
   protocol is periodic and self-correcting.
 - **Timing: partial synchrony.** Message delays and process speeds are usually bounded, but the
   bounds are unknown and may hold only eventually (Dwork–Lynch–Stockmeyer). The heartbeat period
@@ -114,14 +114,14 @@ processes (counting itself) support it.
 **Proposition (no split-brain).** If every process supports at most one candidate at a time and
 acting as leader requires support from `⌊N/2⌋ + 1` processes, then at no time do two processes
 both act as leader on the strength of the same round of support.
-*Proof sketch.* Two majorities intersect (Module 03, quorum-intersection lemma); a process in
+*Proof sketch.* Two majorities intersect (Module 04, quorum-intersection lemma); a process in
 the intersection supports one candidate, not two. ∎
 
 The qualification "same round" is doing real work: because processes re-vote continuously and
 nothing binds a process to its past vote, there are transient schedules in which stale support
 counts overlap. Closing this gap requires making support *epochal* — a monotone term with at most
 one vote per process per term. That refinement is exactly Raft's, and it is the subject of
-Module 05.
+Module 07.
 
 ## 4. Development of the implementation
 
@@ -153,9 +153,9 @@ The two columns are linked by a fundamental result: **Ω is the weakest failure 
 consensus** given a correct majority (Chandra–Hadzilacos–Toueg 1996; without the majority
 assumption, the pair (Σ, Ω) is weakest, where Σ is the quorum detector). Partial synchrony is
 *sufficient* to implement Ω — in fact strictly weaker timing assumptions suffice — and Ω, with a
-majority, suffices for consensus. This module implements Ω; Module 05 consumes it. A fuller
+majority, suffices for consensus. This module implements Ω; Module 07 consumes it. A fuller
 treatment, including why the failure-detector interface does not extend to Byzantine faults, is
-in [CONSENSUS.md](../05-raft/CONSENSUS.md) §§2–4.
+in [CONSENSUS.md](../07-raft/CONSENSUS.md) §§2–4.
 
 ## 6. Correspondence between theory and code
 
@@ -179,10 +179,10 @@ delayed heartbeat produces a false suspicion. Node identifiers are compared nume
 
 - **No terms.** Votes are not epochal; a process may support different candidates over time
   within one unstable period, leaving transient windows under churn (§3.3). Raft's monotone
-  *term* with one vote per term closes this. *(→ Module 05.)*
-- **The leader has no duties.** It is elected and idle; wiring it to Module 03's replication —
+  *term* with one vote per term closes this. *(→ Module 07.)*
+- **The leader has no duties.** It is elected and idle; wiring it to Module 04's replication —
   leader coordinates writes, failover installs a new coordinator — is precisely the combination
-  that becomes Raft. *(→ Module 05.)*
+  that becomes Raft. *(→ Module 07.)*
 - **Fixed timeout.** Production detectors adapt to measured network behavior (e.g. the
   φ-accrual detector); a fixed 3 s trades false suspicions against detection latency bluntly.
 - **Static membership.** The peer set is fixed at launch; joining, leaving, and discovery are
@@ -257,5 +257,6 @@ and observe failover; the `demos/` scripts (`failure_detection.py`, `election.py
 experiments of §4.
 
 ---
-*[Course home](../) · Previous: [Module 03](../03-replicated-kv-store/) · Next:
-[Module 05 — Consensus: Raft](../05-raft/)*
+*[Course home](../) · Previous: [Module 04](../04-replicated-kv-store/) · Next:
+[Module 06 — Logical Time and Broadcast (planned)](../06-logical-time-broadcast/) ·
+[Module 07 — Consensus: Raft](../07-raft/)*

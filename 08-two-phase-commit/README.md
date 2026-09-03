@@ -1,16 +1,16 @@
-# Module 06 — Atomic Commitment: Two-Phase Commit and Its Blocking Behavior
+# Module 08 — Atomic Commitment: Two-Phase Commit and Its Blocking Behavior
 
 *Part of **Concurrent and Distributed Systems in Rust** ([course home](../)). Reference text:
 **CCGR** (Cachin, Guerraoui & Rodrigues, 2nd ed., 2011). Prerequisites:
-[Module 05](../05-raft/) (for the contrast with consensus). Theory companions:
-[CONSENSUS.md](../05-raft/CONSENSUS.md),
+[Module 07](../07-raft/) (for the contrast with consensus). Theory companions:
+[CONSENSUS.md](../07-raft/CONSENSUS.md),
 [CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md).*
 
 **Abstract.** This module implements **two-phase commit (2PC)**, the classical protocol for
 **atomic commitment** of a transaction whose effects span several nodes, and demonstrates —
 constructively, on a running system — its defining weakness: a coordinator crash between the
 voting and decision phases leaves participants *in doubt*, holding locks, unable to terminate.
-Where Module 05's consensus makes progress with any majority, atomic commitment requires
+Where Module 07's consensus makes progress with any majority, atomic commitment requires
 **unanimity** through a single coordinator, and this difference in decision rule produces an
 inversion of fault behavior. The module introduces transactions and their properties (with the
 formal treatment in the theory companion), specifies **non-blocking atomic commitment (NBAC)**
@@ -19,7 +19,7 @@ exhibits the blocking execution, connects the participant's in-doubt state to **
 two-phase locking**, and surveys the repairs (three-phase commit; **Paxos Commit**, atomic
 commitment over consensus). The domain is a bank transfer across accounts held on different
 nodes — a transaction over **partitioned** data, in contrast to the **replicated** data of
-Modules 03 and 05.
+Modules 04 and 07.
 
 ---
 
@@ -54,7 +54,7 @@ through redundancy). This module's nodes hold **different** data — disjoint **
 (shards) of the whole: account *A* on one node, account *B* on another. The two regimes pose
 different problems and admit different decision rules:
 
-| | Replication (03, 05) | Partitioning + atomic commitment (06) |
+| | Replication (04, 07) | Partitioning + atomic commitment (08) |
 |---|---|---|
 | each node holds | a copy of the same data | a distinct shard |
 | goal | survive node loss | all-or-nothing effects across shards |
@@ -118,7 +118,7 @@ Following CCGR §6.1, each participant casts a vote in {YES, NO} and processes d
 - **Timing.** Asynchrony suffices for every safety property; the blocking behavior is a
   *liveness* failure and no timing assumption on the participants' side repairs it (§4.3).
 - **Faults are non-malicious.** Processes follow the protocol or crash; Byzantine behavior
-  (equivocation by the coordinator, false votes) is out of model until Modules 07–08.
+  (equivocation by the coordinator, false votes) is out of model until Modules 10–11.
 
 ## 3. The protocol
 
@@ -144,7 +144,7 @@ remain non-negative, **and** it holds no other in-doubt transaction. Before repl
 must:
 
 1. **record the vote durably** — write `(txid, δ)` to stable storage and `fsync` it, *then*
-   reply (persist-before-externalize, exactly as in Module 05 §4); and
+   reply (persist-before-externalize, exactly as in Module 07 §4); and
 2. **enter the in-doubt state** — set `prepared = (txid, δ)`, reserving the resources. From
    this point the participant has issued a *promise*: it guarantees it will be able to commit
    δ if told to. It must refuse conflicting work (here: any other PREPARE) until released.
@@ -205,16 +205,16 @@ supplying the missing event from elsewhere, which is exactly what the repairs of
 
 The blocking of 2PC is not an implementation defect but the shadow of a genuine impossibility
 gap. In the failure-detector hierarchy, NBAC is *harder* than consensus: consensus is solvable
-with the eventual leader detector Ω and a correct majority (Module 05), whereas NBAC in general
+with the eventual leader detector Ω and a correct majority (Module 07), whereas NBAC in general
 requires the **perfect** failure detector *P* — deciding COMMIT requires certainty that no
 participant has crashed (NBAC4 ties the outcome to crashes), and certainty about crashes is
 exactly what no eventually-accurate detector provides (CCGR Ch. 6 develops NBAC from consensus
 plus a perfect failure detector). Two consequences follow: under partial synchrony one should
 *expect* atomic commitment to inherit consensus's machinery rather than avoid it; and the
-"unanimity vs. majority" contrast with Module 05 is a difference in *validity properties*, not
+"unanimity vs. majority" contrast with Module 07 is a difference in *validity properties*, not
 merely in engineering.
 
-| | Consensus (05) | Atomic commitment (06) |
+| | Consensus (07) | Atomic commitment (08) |
 |---|---|---|
 | decision function | any proposed value | conjunction of votes (COMMIT iff all YES) |
 | decision quorum | majority | all participants, via one coordinator |
@@ -256,7 +256,7 @@ distinction is in [CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENC
   in a consensus instance (or the coordinator is a replicated state machine); no single crash
   can then withhold the verdict. 2PC is the degenerate case with one acceptor.
 - **The layered architecture.** Production systems compose both regimes of §1.1: data is
-  partitioned into shards, each shard is *replicated* as a consensus group (Module 05), and
+  partitioned into shards, each shard is *replicated* as a consensus group (Module 07), and
   cross-shard transactions run *atomic commitment* (this module) across shard leaders, with the
   per-shard groups standing in for both durable participants and a durable coordinator. Google
   Spanner is the canonical example (2PC over Paxos groups); CockroachDB's parallel commit is an
@@ -274,7 +274,7 @@ distinction is in [CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENC
 | the blocking execution | the `transfer-crash` command: run Phase 1, then stop — no verdict is ever sent |
 
 Implementation notes. The participant is deliberately **passive and sequential** — a single
-accept loop, no shared-state concurrency (contrast Module 05's timer thread and
+accept loop, no shared-state concurrency (contrast Module 07's timer thread and
 `Arc<Mutex<State>>`): it takes no step except in response to the coordinator. This passivity is
 the architectural mirror of the blocking result — a process with no autonomous behavior has no
 mechanism by which to rescue itself. The coordinator's `transfer-crash` is a test hook that
@@ -311,7 +311,7 @@ realizes the §4.1 crash point deterministically, in the tradition of fault inje
    decision; if any has *not voted*, all may abort. Which executions of §4.1 does this rescue,
    and which (all participants in doubt) remain blocked?
 5. **(Paxos Commit, on paper.)** Design — at the level of messages and state — atomic
-   commitment for this module's transfer using Module 05's Raft as a service: where do votes
+   commitment for this module's transfer using Module 07's Raft as a service: where do votes
    live, who proposes the outcome, and why does a coordinator crash no longer block? Compare
    message counts with plain 2PC in the failure-free case.
 6. **(2PL.)** Give a two-transaction, two-account schedule admitted if participants release
@@ -367,6 +367,7 @@ Per-participant state persists in `2pc-<port>.state`. The `demos/` scripts (`hap
 `abort.py`, `persistence.py`, `blocking.py`) reproduce §3–§4 end to end.
 
 ---
-*[Course home](../) · Previous: [Module 05](../05-raft/) · Next: Module 07 — Byzantine Reliable
-Broadcast (planned) · Theory maps: [CONSENSUS.md](../05-raft/CONSENSUS.md) ·
+*[Course home](../) · Previous: [Module 07](../07-raft/) · Next:
+[Module 09 — Concurrency Control (planned)](../09-concurrency-control/) · Theory maps:
+[CONSENSUS.md](../07-raft/CONSENSUS.md) ·
 [CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md)*

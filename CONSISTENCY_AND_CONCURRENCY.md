@@ -1,8 +1,8 @@
 # Consistency and Concurrency — Lecture Notes
 
 *Part of **Concurrent and Distributed Systems in Rust** ([course home](README.md)). Companion
-theory map: [CONSENSUS.md](05-raft/CONSENSUS.md) (agreement and impossibility). These notes are
-referenced from Modules 02, 03, 05, and 06.*
+theory map: [CONSENSUS.md](07-raft/CONSENSUS.md) (agreement and impossibility). These notes are
+referenced from Modules 02, 04, 07, and 08.*
 
 **Abstract.** These notes organize a cluster of frequently conflated concepts along two
 orthogonal axes: the **execution axis** — how work is scheduled (sequential, concurrent,
@@ -71,8 +71,8 @@ concurrent program becomes parallel when given more cores, without structural ch
 
 Where the danger lies: a purely sequential program cannot race. Both concurrency (interleaving
 at an inopportune point) and parallelism (true simultaneity) can corrupt shared state; hence
-the consistency axis. In this course the contrast is embodied by Module 05's Raft node (timer
-thread + connection handlers sharing state — concurrent, synchronized) versus Module 06's 2PC
+the consistency axis. In this course the contrast is embodied by Module 07's Raft node (timer
+thread + connection handlers sharing state — concurrent, synchronized) versus Module 08's 2PC
 participant (a single sequential loop — no synchronization required, by construction).
 
 ## 2. Shared state and mutual exclusion
@@ -82,7 +82,7 @@ requesting a held mutex blocks until release. In Rust, `Mutex::lock` returns a g
 scope *is* the critical section — release is automatic at scope exit.
 
 Two classical hazards. (i) *Long critical sections serialize the system* — whence the
-engineering rule, recurring in Module 05, never to hold a lock across network I/O. (ii) *Cyclic
+engineering rule, recurring in Module 07, never to hold a lock across network I/O. (ii) *Cyclic
 acquisition deadlocks*: thread A holds `L₁` and requests `L₂` while B holds `L₂` and requests
 `L₁`. (A non-reentrant mutex yields the one-thread degenerate case: re-acquiring a held lock
 self-deadlocks.)
@@ -154,9 +154,9 @@ for a single writer; the multi-writer generalization is standard only for atomic
   concurrent with a write may return *any* value of the domain.
 - **Regular** — a concurrent read returns either the last written or a concurrently written
   value (no fabricated values); sequential reads overlapping one write may still observe
-  new-then-old. Module 03's majority-voting register is regular.
+  new-then-old. Module 04's majority-voting register is regular.
 - **Atomic** — linearizable; the new-then-old inversion is excluded. The upgrade from regular
-  is the read-impose (write-back) step (Module 03 §6; ABD).
+  is the read-impose (write-back) step (Module 04 §6; ABD).
 
 ### 3.5 Intuition
 
@@ -167,7 +167,7 @@ glancing at 12:00:07 must see *leek*; a reader glancing *during* the rewrite may
 all observers' accounts must be reconcilable with a single instant at which the change took
 effect. A replicated object that lets a completed write remain invisible to a later read — two
 whiteboards, lazily synchronized — is precisely a non-linearizable one, and making replicated
-objects linearizable is what quorums (Module 03) and consensus (Module 05) are *for*.
+objects linearizable is what quorums (Module 04) and consensus (Module 07) are *for*.
 
 ## 4. Transactions: ACID, schedules, serializability
 
@@ -304,8 +304,8 @@ sufficient for its target guarantee and none uniquely necessary.
 - *One machine:* a mutex serializing operations; a single-threaded event loop; lock-free
   algorithms based on atomic read-modify-write instructions (CAS).
 - *Replicated:* there is no shared memory to lock — the guarantee must be engineered from
-  quorum intersection (ABD-style majority reads/writes with write-back; Module 03) or from
-  consensus establishing a total operation order (a replicated state machine; Module 05).
+  quorum intersection (ABD-style majority reads/writes with write-back; Module 04) or from
+  consensus establishing a total operation order (a replicated state machine; Module 07).
 
 **Transaction serializability.**
 - **Two-phase locking (2PL).** Each transaction acquires all its locks before releasing any
@@ -319,7 +319,7 @@ sufficient for its target guarantee and none uniquely necessary.
   commit/abort, adding recoverability and precluding cascading aborts (§7); **rigorous 2PL**
   holds all locks to commit/abort. These stronger variants change the *recovery* properties,
   not serializability, which basic 2PL already provides. Costs: blocking, and deadlock
-  (resolved by ordering, timeout, or victim abort). Module 06's `prepared` state is strict 2PL
+  (resolved by ordering, timeout, or victim abort). Module 08's `prepared` state is strict 2PL
   across machines.
 - **Multiversion concurrency control (MVCC).** Maintain versions; give each reader a
   consistent snapshot. Snapshot isolation alone is *not* serializable (write skew);
@@ -334,7 +334,7 @@ The engineering content of all four is the same trade: give up some concurrency 
 aborts and retries) to exclude exactly the non-serializable interleavings — pessimistically in
 advance (locks), or optimistically after the fact (validation).
 
-**Atomic commitment across nodes** — atomicity, a different letter of ACID — is Module 06's
+**Atomic commitment across nodes** — atomicity, a different letter of ACID — is Module 08's
 2PC, with Paxos Commit (Gray & Lamport 2006) its non-blocking, consensus-based repair.
 
 ## 7. The ACID properties disentangled
@@ -344,9 +344,9 @@ orthogonal, with precise points of contact:
 
 | Property | Concern | Adversary | Mechanism (in this course) |
 |---|---|---|---|
-| atomicity | one transaction's effects | **failure** (crash, abort) | commit protocols (Module 06); undo logging |
+| atomicity | one transaction's effects | **failure** (crash, abort) | commit protocols (Module 08); undo logging |
 | isolation / serializability | many transactions' interference | **concurrency** | 2PL / MVCC / OCC (§6) |
-| durability | committed effects | crash | stable storage, WAL, fsync (Modules 01, 05, 06) |
+| durability | committed effects | crash | stable storage, WAL, fsync (Modules 01, 07, 08) |
 | consistency (C) | application invariants | — | the application, given A/I/D |
 
 Two independence tests. *Isolation is not about failure:* in a crash-free, abort-free
@@ -367,9 +367,9 @@ provide the stronger ones; this — not serializability — is what "holding loc
 ## 8. Replication versus partitioning
 
 Orthogonal to everything above is *where the data lives* — and the distinction explains why
-Modules 03/05 and Module 06 have opposite fault profiles:
+Modules 04/07 and Module 08 have opposite fault profiles:
 
-| | **Replication** (03, 05) | **Partitioning** (06) |
+| | **Replication** (04, 07) | **Partitioning** (08) |
 |---|---|---|
 | each node holds | the same data (a copy) | different data (a shard) |
 | purpose | fault tolerance, read scale | capacity; multi-item transactions across nodes |
@@ -378,7 +378,7 @@ Modules 03/05 and Module 06 have opposite fault profiles:
 | minority crash | tolerated | forces abort or blocks |
 
 Production architectures compose the two: partition the data into shards; replicate each shard
-as a consensus group (Raft/Paxos — Module 05); run atomic commitment (2PC — Module 06) across
+as a consensus group (Raft/Paxos — Module 07); run atomic commitment (2PC — Module 08) across
 shard leaders for multi-shard transactions, with the consensus layer making both participants
 and coordinator durable. Spanner and CockroachDB instantiate this composition. In terms of the
 taxonomy of §5: per-shard consensus supplies linearizable single-shard operations; cross-shard
@@ -449,4 +449,4 @@ noted there.
 - J. Gray, L. Lamport, *Consensus on Transaction Commit*, ACM TODS 31(1), 2006.
 
 ---
-*[Course home](README.md) · Companion: [CONSENSUS.md](05-raft/CONSENSUS.md)*
+*[Course home](README.md) · Companion: [CONSENSUS.md](07-raft/CONSENSUS.md)*

@@ -1,16 +1,16 @@
-# Module 05 — Consensus: Raft and the Replicated State Machine
+# Module 07 — Consensus: Raft and the Replicated State Machine
 
 *Part of **Concurrent and Distributed Systems in Rust** ([course home](../)). Reference text:
 **CCGR** (Cachin, Guerraoui & Rodrigues, 2nd ed., 2011). Prerequisites:
-[Module 03](../03-replicated-kv-store/), [Module 04](../04-leader-election/). Theory companion:
+[Module 04](../04-replicated-kv-store/), [Module 05](../05-leader-election/). Theory companion:
 [CONSENSUS.md](CONSENSUS.md).*
 
 **Abstract.** This module implements the **Raft** consensus algorithm (Ongaro & Ousterhout 2014)
 for crash faults and uses it to realize **state-machine replication**: a cluster elects a leader
 per **term**, replicates a log of client commands, marks an entry **committed** once a majority
 stores it, and applies committed entries in order to a key-value state machine, so that the
-service survives the failure of any minority — including the leader. The module unifies the two
-preceding ones: Module 03's quorum-replicated data plane and Module 04's election become a
+service survives the failure of any minority — including the leader. The module unifies
+Modules 04 and 05: the quorum-replicated data plane and the leader election become a
 single algorithm in which the same majority-intersection argument guards both leadership and
 commitment. The safety-critical content is concentrated in two rules — the **election
 restriction** (leader completeness) and the **commit-term rule** (the "Figure 8" scenario) —
@@ -35,15 +35,15 @@ After completing this module, the reader should be able to:
 5. reproduce the "Figure 8" counterexample and state the commit-term rule that excludes it;
 6. specify which state must reach stable storage, and at which points, for the algorithm to be
    correct under crash-recovery (*persist before you externalize*);
-7. distinguish committed from applied entries, and majority-commit from unanimity (Module 06).
+7. distinguish committed from applied entries, and majority-commit from unanimity (Module 08).
 
 ---
 
 ## 1. Motivation
 
-Modules 03 and 04 each stop one step short of fault-tolerant service. The replicated register
-of Module 03 has no failover: its writer is fixed, and the writer's crash halts writes
-permanently. The election of Module 04 produces a leader with no duties — and without epochs its
+Modules 04 and 05 each stop one step short of fault-tolerant service. The replicated register
+of Module 04 has no failover: its writer is fixed, and the writer's crash halts writes
+permanently. The election of Module 05 produces a leader with no duties — and without epochs its
 guarantees are only eventual. **Consensus** closes the gap: it lets a set of processes agree on
 a single growing *sequence* of operations despite crashes, so that leadership can move without
 losing, duplicating, or reordering anything already decided.
@@ -71,7 +71,7 @@ equivalent to consensus (CCGR Ch. 6).
 **Impossibility and its circumvention.** By FLP, no deterministic algorithm solves consensus in
 a fully asynchronous system with even one crash. Raft assumes **partial synchrony**: its
 randomized election timeouts are an implementation of the eventual leader detector Ω
-(Module 04). The division of labor is strict — *safety never depends on timing*; timeouts affect
+(Module 05). The division of labor is strict — *safety never depends on timing*; timeouts affect
 only liveness (elections may be delayed or repeated, commitments are never contradicted). See
 [CONSENSUS.md](CONSENSUS.md) §§2–4.
 
@@ -81,7 +81,7 @@ only liveness (elections may be delayed or repeated, commitments are never contr
   majority (`f + 1`).
 - **Failures.** Crash-recovery: nodes may crash and rejoin, retaining only what they wrote to
   stable storage (§6).
-- **Links.** Perfect point-to-point links (TCP), as in Modules 02–03.
+- **Links.** Perfect point-to-point links (TCP), as in Modules 02 and 04.
 - **Timing.** Partially synchronous: safety unconditional; liveness after stabilization.
 
 ## 3. The algorithm
@@ -139,7 +139,7 @@ grants its vote to candidates whose log is at least as up-to-date — which, by 
 elections, forces the winner's log to contain the entry. ∎
 
 Leadership may therefore change, but never regresses the committed prefix — the same quorum
-intersection as Module 03, now guarding *history* rather than a single value.
+intersection as Module 04, now guarding *history* rather than a single value.
 
 **Commit-term rule ("Figure 8").** A leader may count a majority toward commitment **only for
 entries of its own term**; earlier-term entries become committed indirectly, when an own-term
@@ -170,7 +170,7 @@ persists the commit index as well, as an optimization); the state machine (`kv`)
 volatile, reconstructed by replay on restart. Recovery composes two mechanisms: **reload and
 replay** (stable storage restores identity — no double vote, no lost committed prefix) and
 **catch-up** (the current leader's `AppendEntries` brings a lagging log forward — the general
-mechanism that subsumes Module 03's snapshot transfer). This is CCGR's crash-recovery model
+mechanism that subsumes Module 04's snapshot transfer). This is CCGR's crash-recovery model
 (§2.2.4) applied to consensus state.
 
 ## 5. Development of the implementation
@@ -194,7 +194,7 @@ intact.
 ## 6. In the CCGR framework
 
 Raft instantiates CCGR's **fail-noisy leader-driven consensus** (Ch. 5, §5.3), providing
-*uniform* consensus: an eventual leader detector Ω (Module 04; here implemented by randomized
+*uniform* consensus: an eventual leader detector Ω (Module 05; here implemented by randomized
 timeouts) drives **epochs** — Raft's terms — and within an epoch values are imposed and locked
 through **majority quorums** (§2.7.3). The correspondence: a term is an epoch; the election is
 the epoch-change; `AppendEntries` is the epoch's propose/decide exchange; the election
@@ -239,7 +239,7 @@ across a blocking round-trip is the canonical route to distributed deadlock). Wi
   lease, so a deposed leader could briefly serve stale reads.
 - **Crash faults only.** Nodes may halt but never lie. Byzantine behavior invalidates the trust
   the protocol places in unauthenticated terms and acknowledgments; tolerating it requires
-  `3f + 1` nodes, signed certificates, and a view-change — Modules 07–08.
+  `3f + 1` nodes, signed certificates, and a view-change — Modules 10–11.
 
 ## 9. Exercises
 
@@ -260,7 +260,7 @@ across a blocking round-trip is the canonical route to distributed deadlock). Wi
    Construct a scenario (network partition, new leader elected elsewhere) where this returns a
    stale value, and implement or sketch ReadIndex: the leader confirms its leadership with a
    majority round before serving the read.
-6. **(Randomization vs. ranks.)** Module 04 elected the *smallest id*; Raft elects *whoever
+6. **(Randomization vs. ranks.)** Module 05 elected the *smallest id*; Raft elects *whoever
    times out first*. Discuss the liveness failure mode of each rule under (a) a crashed lowest
    node, (b) synchronized timeouts, and why Raft randomizes rather than ranks.
 
@@ -308,6 +308,6 @@ data. Per-node state persists in `raft-<port>.state`. The `demos/` scripts repro
 experiments of §5.
 
 ---
-*[Course home](../) · Previous: [Module 04](../04-leader-election/) · Next:
-[Module 06 — Atomic Commitment](../06-two-phase-commit/) · Theory map:
+*[Course home](../) · Previous: [Module 06 (planned)](../06-logical-time-broadcast/) · Next:
+[Module 08 — Atomic Commitment](../08-two-phase-commit/) · Theory map:
 [CONSENSUS.md](CONSENSUS.md)*

@@ -85,10 +85,10 @@ registers, one per key; `get(k)` is a read of register `k`, `set(k, v)` a write,
 
 In this module there is one process, no concurrency, and no failure, so every execution is
 sequential and the implementation satisfies the sequential specification by construction. The
-substance of register theory — and of Modules 03 onward — is preserving this specification when
+substance of register theory — and of Modules 04 onward — is preserving this specification when
 the register is **replicated** across processes that fail and messages that are delayed:
 the *regular* and *atomic* (linearizable) register conditions of CCGR §4.1 are exactly graded
-weakenings and restorations of the sequential specification under concurrency. Module 03
+weakenings and restorations of the sequential specification under concurrency. Module 04
 constructs a fault-tolerant register; the theory companion
 [CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md) develops the consistency
 conditions formally.
@@ -101,7 +101,7 @@ across crashes; it is what allows an algorithm designed for crash-stop failures 
 the **crash-recovery** model, where a process may crash, lose its volatile state (*amnesia*), and
 rejoin. In practice stable storage means a file system with explicit flushing (`fsync`), and the
 discipline that matters is *when* state reaches disk relative to the messages a process sends —
-a point this course returns to repeatedly (Modules 05 and 06 both depend on it, under the slogan
+a point this course returns to repeatedly (Modules 07 and 08 both depend on it, under the slogan
 *persist before you externalize*).
 
 This module implements the weakest useful form of durability: the store is serialized to disk
@@ -112,7 +112,7 @@ Two further observations that recur throughout the course:
 
 - **The log is fundamental.** Append-only logs underlie single-node engines (Bitcask, LSM-trees),
   replication streams, write-ahead logging, and the replicated log at the heart of consensus
-  (Module 05). The whole-file rewrite used here is the baseline against which the log is the
+  (Module 07). The whole-file rewrite used here is the baseline against which the log is the
   improvement.
 - **Serialization formats are contracts.** Changing the on-disk format breaks previously written
   files; production systems version their formats and provide migrations. (This project switched
@@ -153,12 +153,12 @@ Each limitation below is deliberate and names the module or technique that addre
 
 - **Not crash-safe.** State is saved only on exit; a crash beforehand loses all writes since
   startup. Crash safety requires logging each update to stable storage *before* acknowledging it
-  (write-ahead logging + `fsync`). *(→ stable storage discipline, Modules 05–06.)*
+  (write-ahead logging + `fsync`). *(→ stable storage discipline, Modules 07–08.)*
 - **O(n) persistence.** The entire store is rewritten on save. Append-only logs and LSM-trees
   make the cost of persistence proportional to the update, at the price of compaction machinery.
 - **Single process.** No network interface. *(→ Module 02.)*
 - **No replication, no consistency model, no agreement.** One copy of the data; the questions of
-  consistency between copies and agreement on update order do not yet arise. *(→ Modules 03–05.)*
+  consistency between copies and agreement on update order do not yet arise. *(→ Modules 04–07.)*
 
 ## 7. Exercises
 

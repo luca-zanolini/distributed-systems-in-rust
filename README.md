@@ -19,9 +19,9 @@ Three commitments distinguish the material:
 
 1. **Theory with its hands dirty.** Every impossibility, property, and trade-off that can be
    demonstrated *is* demonstrated on a running cluster: the CAP trade-off is a killed replica
-   refusing a synchronous write (Module 03); the eventual accuracy of ◇P is a `SUSPECT` line
-   retracted on recovery (Module 04); the blocking of 2PC is a cluster of processes wedged
-   in-doubt on a terminal (Module 06).
+   refusing a synchronous write (Module 04); the eventual accuracy of ◇P is a `SUSPECT` line
+   retracted on recovery (Module 05); the blocking of 2PC is a cluster of processes wedged
+   in-doubt on a terminal (Module 08).
 2. **One staircase, one artifact.** A single key-value store is carried from a local `HashMap`
    to a consensus-replicated, transaction-capable system; each module adds exactly one
    distribution concern, and each module's closing limitations are the next module's opening
@@ -31,28 +31,35 @@ Three commitments distinguish the material:
 
 ## Modules
 
-| # | Module | Abstraction (CCGR) | Status |
-|---|---|---|---|
-| 01 | [The Key-Value Store](01-kv-store/) — state, durability, the register | registers (Ch. 4); stable storage (§2.2.4) | ✅ |
-| 02 | [The Networked Store](02-networked-kv-store/) — processes, links, local concurrency | processes & perfect links (§2.1, §2.4); crash-stop (§2.2.2); safety/liveness (§2.1.3) | ✅ |
-| 03 | [Replication and Quorums](03-replicated-kv-store/) — the (1, N) regular register | majority voting (§4.2.3); quorums (§2.7.3); crash-recovery (§2.2.4) | ✅ |
-| 04 | [Failure Detection and Leader Election](04-leader-election/) — ◇P and Ω from heartbeats | failure detectors & Ω (§2.6); timing models (§2.5) | ✅ |
-| 05 | [Consensus: Raft](05-raft/) — terms, replicated log, majority commit, safety rules, persistence | (uniform) consensus, leader-driven (Ch. 5, §5.3) | ✅ |
-| 06 | [Atomic Commitment: 2PC](06-two-phase-commit/) — transactions, unanimity, the blocking flaw, strict 2PL | NBAC (§6.1); P vs. ◇P separation | ✅ |
-| 07 | Byzantine Reliable Broadcast — Bracha's protocol: `3f+1`, echo/ready amplification | Byzantine broadcast (Ch. 3) | planned |
-| 08 | Byzantine Consensus — PBFT-style: two-phase voting, certificates, view-change | Byzantine consensus (Ch. 5) | planned |
+Module numbers give the **teaching order**. (The repository was not built in this order;
+placeholders mark modules whose notes and code are still to come.)
 
-**Why 07 before 08.** Byzantine *reliable broadcast* (Bracha 1987) is the correct first
-Byzantine primitive: it introduces the `n > 3f` bound, supermajority quorums, and the
-echo/ready amplification pattern — the consistency mechanics of the Byzantine world — without
-view changes or leader replacement. CCGR follows the same order (Byzantine broadcast in Ch. 3
-before Byzantine consensus in Ch. 5), and PBFT's prepare/commit certificates are structurally
-Bracha's echo/ready phases put in service of agreement. Module 08 then isolates what is *new*
-in Byzantine consensus: the view-change.
+| # | Module | Abstraction | Status |
+|---|---|---|---|
+| 01 | [The Key-Value Store](01-kv-store/) — state, durability, the register | registers (CCGR Ch. 4); stable storage (§2.2.4) | ✅ |
+| 02 | [The Networked Store](02-networked-kv-store/) — processes, links, local concurrency | processes & perfect links (§2.1, §2.4); crash-stop; safety/liveness | ✅ |
+| 03 | [Shared-Memory Concurrency](03-shared-memory-concurrency/) — semaphores, monitors, deadlock, lock-free | mutual exclusion; progress properties | 🔲 planned |
+| 04 | [Replication and Quorums](04-replicated-kv-store/) — the (1, N) regular register | majority voting (§4.2.3); quorums (§2.7.3) | ✅ |
+| 05 | [Failure Detection and Leader Election](05-leader-election/) — ◇P and Ω from heartbeats | failure detectors & Ω (§2.6); timing (§2.5) | ✅ |
+| 06 | [Logical Time and Broadcast](06-logical-time-broadcast/) — Lamport/vector clocks; FIFO/causal/total order | broadcast hierarchy (Ch. 3); TOB ⟺ consensus | 🔲 planned |
+| 07 | [Consensus: Raft](07-raft/) — terms, replicated log, majority commit, safety, persistence | uniform consensus, leader-driven (Ch. 5) | ✅ |
+| 08 | [Atomic Commitment: 2PC](08-two-phase-commit/) — transactions, unanimity, blocking, strict 2PL | NBAC (§6.1); P vs. ◇P | ✅ |
+| 09 | [Concurrency Control](09-concurrency-control/) — 2PL, OCC, MVCC; anomalies as tests | serializability mechanisms | 🔲 planned |
+| 10 | [Byzantine Reliable Broadcast](10-byzantine-broadcast/) — Bracha: `3f+1`, echo/ready | Byzantine broadcast (Ch. 3) | ▶ **next** |
+| 11 | [Byzantine Consensus](11-byzantine-consensus/) — PBFT-style: certificates, view-change | Byzantine consensus (Ch. 5) | 🔲 planned |
+| 12 | [Eventual Consistency, CRDTs, Gossip](12-crdts-eventual-consistency/) — SEC, semilattices, anti-entropy | the AP regime | 🔲 planned |
+
+**Why Byzantine broadcast (10) precedes Byzantine consensus (11).** Bracha's reliable
+broadcast is the correct first Byzantine primitive: it introduces the `n > 3f` bound,
+supermajority quorums, and echo/ready amplification — the consistency mechanics of the
+Byzantine world — without view changes. CCGR follows the same order (broadcast in Ch. 3 before
+consensus in Ch. 5), and PBFT's prepare/commit certificates are structurally Bracha's
+echo/ready phases put in service of agreement; Module 11 then isolates what is genuinely new:
+the view-change.
 
 ## Theory notes (cross-module lecture notes)
 
-- [**CONSENSUS.md**](05-raft/CONSENSUS.md) — agreement and impossibility: the consensus
+- [**CONSENSUS.md**](07-raft/CONSENSUS.md) — agreement and impossibility: the consensus
   specification, FLP and its two circumventions, timing models and failure detectors
   (P, ◇P, Ω; CHT), quorum arithmetic (majority vs. `3f+1`), protocol families
   (Paxos/Raft/PBFT/HotStuff), consensus vs. atomic commitment, CAP.
@@ -62,36 +69,23 @@ in Byzantine consensus: the view-change.
   schedules/serializability (conflict vs. view), strict serializability, 2PL and its variants,
   MVCC/OCC, replication vs. partitioning.
 
-## Syllabus context and planned extensions
-
-The current eight modules cover the *agreement-centric* core of a distributed-systems course.
-Benchmarked against a full curriculum — e.g., Cambridge's *Concurrent and Distributed Systems*
-(whose distributed half runs: models and faults → time → logical time and broadcast →
-replication → consensus → 2PC and consistency → CRDTs/Spanner case studies) and CCGR's own
-span — the natural extensions, in rough priority order:
-
-| Candidate module | Content | Sources |
-|---|---|---|
-| **Logical time & broadcast** | happens-before, Lamport and vector clocks; FIFO / causal / total-order broadcast; the equivalence of total-order broadcast and consensus | Lamport 1978; CCGR Ch. 3, §6.1 |
-| **Concurrency in the small** | a dedicated shared-memory module: semaphores, condition variables/monitors, producer–consumer, reader–writer, deadlock (detection, avoidance, ordering), priority inversion; atomics and a lock-free structure in Rust | Herlihy–Shavit; course notes |
-| **Concurrency control, hands-on** | implement 2PL with deadlock handling, OCC, and MVCC/snapshot isolation over the store; exhibit the isolation anomalies (lost update, write skew) as tests | Bernstein et al. 1987; Cahill et al. 2008 |
-| **Eventual consistency & CRDTs** | convergent replicated data types (counters, sets, registers); anti-entropy and gossip; the AP side of CAP | Shapiro et al. 2011; DeCandia et al. 2007 |
-| **Physical time** | clock drift and synchronization, NTP; bounded-uncertainty clocks and commit-wait (TrueTime); Spanner as a capstone case study | Corbett et al. 2012 |
-| **Membership & failure detection at scale** | gossip protocols, SWIM, φ-accrual detectors | Das et al. 2002 |
-| **Global snapshots** | consistent cuts; Chandy–Lamport | Chandy & Lamport 1985 |
+Planned notes-level additions (deliberately not modules): **physical time** — clock
+synchronization, NTP, bounded-uncertainty clocks and commit-wait, with **Spanner** as the
+closing case study tying together Modules 04, 07, 08 and strict serializability;
+**Chandy–Lamport snapshots** appear as an exercise in Module 06.
 
 ## Using this material
 
-Each module directory contains: `README.md` (the module notes: objectives, system model,
+Each built module directory contains: `README.md` (the module notes: objectives, system model,
 formal specifications, algorithm and correctness argument, implementation correspondence,
 limitations, exercises, references), `src/` (the Rust implementation), and `demos/`
 (scripted failure experiments that reproduce the notes' claims against real processes over
-TCP). Modules are self-standing but reference one another; the intended order is numerical.
+TCP). Planned modules carry a syllabus-level README stating scope, deliverables, and sources.
 Exercises range from proofs and counterexample constructions to implementation extensions and
 are suitable as homework.
 
-Build any module with `cargo build` in its directory; the demos require only Python 3 and the
-compiled binary.
+Build any implemented module with `cargo build` in its directory; the demos require only
+Python 3 and the compiled binary.
 
 ## Author
 

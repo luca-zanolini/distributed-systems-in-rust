@@ -2,7 +2,7 @@
 
 *Part of **Concurrent and Distributed Systems in Rust** ([course home](../)). Companion:
 [CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md). The implementation this
-document accompanies is [Module 05 (Raft)](README.md); it is also referenced from Modules 03,
+document accompanies is [Module 07 (Raft)](README.md); it is also referenced from Modules 04,
 04, and 06.*
 
 **Abstract.** These notes map the theory of distributed agreement: the consensus specification;
@@ -91,12 +91,12 @@ Partial synchrony (Dwork–Lynch–Stockmeyer 1988) is the model practical syste
 network is usually timely and occasionally arbitrary. Well-designed protocols are **safe
 unconditionally** and **live after GST** — Raft's randomized election timeout is the canonical
 example: before stabilization, elections may split and repeat (a liveness cost only); after it,
-a single leader emerges and commits proceed. Modules 04 and 05 implement exactly this regime.
+a single leader emerges and commits proceed. Modules 05 and 07 implement exactly this regime.
 
 ## 4. The failure-detector lens
 
 A **failure detector** packages timing assumptions as a per-process oracle (CCGR §2.6);
-Module 04 states the specifications formally. The correspondence:
+Module 05 states the specifications formally. The correspondence:
 
 | Timing model | Implementable detector |
 |---|---|
@@ -114,7 +114,7 @@ partial synchrony suffices for Ω (but is not necessary — §2), the timing len
 lens draw essentially the same boundary, with Ω marking it slightly more finely.
 
 Summary: *synchrony yields P; partial synchrony yields ◇P and Ω; asynchrony yields nothing
-strong enough (FLP).* Module 04 constructs ◇P and Ω from heartbeats; Module 05 consumes Ω.
+strong enough (FLP).* Module 05 constructs ◇P and Ω from heartbeats; Module 07 consumes Ω.
 
 ## 5. Fault models
 
@@ -123,7 +123,7 @@ Timing determines *solvability*; the fault model determines *cost* — chiefly, 
 
 - **Crash-stop.** A faulty process halts and takes no further steps.
 - **Crash-recovery.** A faulty process may halt and later rejoin, having lost volatile state;
-  algorithms compensate with stable storage (Modules 05–06: *persist before you externalize*).
+  algorithms compensate with stable storage (Modules 07–08: *persist before you externalize*).
 - **Byzantine (arbitrary).** A faulty process may deviate arbitrarily: lie, equivocate, send
   conflicting messages to different peers, collude. Authentication (signatures) limits but does
   not eliminate the deviations.
@@ -136,12 +136,12 @@ dead") with *distrusting content* ("any message may be false") — and changes t
 **Definition.** A **quorum system** over `N` processes is a collection of subsets (quorums)
 such that any two quorums intersect. Protocol steps (votes, acknowledgments, promises) are
 validated by quorums; intersection is what carries information from one protocol step — or one
-leadership epoch — to the next: the common member "remembers." (CCGR §2.7.3; Module 03 proves
+leadership epoch — to the next: the common member "remembers." (CCGR §2.7.3; Module 04 proves
 the intersection lemma.)
 
 **Crash faults: majority quorums.** With `N = 2f + 1` tolerating `f` crashes, quorums of size
 `f + 1 = ⌈(N+1)/2⌉` intersect in at least one process, and a quorum of correct processes always
-exists (availability). This is every quorum in Modules 03–05.
+exists (availability). This is every quorum in Modules 04, 05, and 07.
 
 **Byzantine faults: supermajority quorums.** Intersection must now contain at least one
 *honest* process — a Byzantine one in the overlap may tell each side a different story. Two
@@ -179,7 +179,7 @@ quorum type:
 | quorum | majority | majority | `2f+1` of `3f+1` | `2f+1` of `3f+1` |
 
 - **Raft ≈ Multi-Paxos** with a strong leader: elect once per term; thereafter one majority
-  round-trip per command (Module 05).
+  round-trip per command (Module 07).
 - **PBFT** (Castro–Liskov 1999) requires a second voting phase: after *prepare* establishes
   agreement on ordering within a view, *commit* ensures the decision survives a view-change —
   lifting "a quorum knows" to "a quorum knows that a quorum knows," which is what a new leader
@@ -197,12 +197,12 @@ concerns meet in the **view-change**, which must simultaneously depose a suspect
 committed value. The view-change is where the second voting phase pays off, where classic PBFT
 incurred its `O(n³)` worst case, and where HotStuff's chief innovation lies (a linear,
 uniform rule). It is, by common experience, the most defect-prone component of deployed BFT
-systems — the practical reason Module 08 treats it as a first-class topic rather than a
+systems — the practical reason Module 11 treats it as a first-class topic rather than a
 footnote.
 
 ## 8. Consensus is not atomic commitment
 
-**Atomic commitment** (Module 06; CCGR §6.1) resembles consensus — all processes must reach one
+**Atomic commitment** (Module 08; CCGR §6.1) resembles consensus — all processes must reach one
 decision — but differs in both defining dimensions:
 
 - **Decision function.** Consensus may decide any proposed value (C2). Atomic commitment's
@@ -210,7 +210,7 @@ decision — but differs in both defining dimensions:
   one crash) forces ABORT. Unanimity, not choice.
 - **Fault tolerance.** Consensus proceeds with any majority. Two-phase commit **blocks**: a
   coordinator crash between voting and decision strands participants in doubt, holding locks,
-  unable to terminate (demonstrated end-to-end in Module 06).
+  unable to terminate (demonstrated end-to-end in Module 08).
 
 The failure-detector hierarchy makes the difference precise: consensus requires Ω (with a
 majority), while non-blocking atomic commitment in general requires the **perfect** detector P
@@ -234,7 +234,7 @@ simultaneously guarantee consistency (linearizability), availability (every requ
 non-failed node receives a response), and tolerance of network partitions.
 
 During a partition, a system chooses: refuse service on the minority side (consistency over
-availability — the choice of every quorum protocol in this course: Module 03 returns
+availability — the choice of every quorum protocol in this course: Module 04 returns
 `ERR no quorum`; Raft simply has no leader on a minority partition) or serve stale data
 (availability over consistency — the Dynamo family, with reconciliation machinery downstream).
 CAP is thus not an exotic limit but the operational face of quorum intersection: the same
@@ -245,12 +245,18 @@ arithmetic that provides safety necessarily withholds service from minorities.
 | Module | Position |
 |---|---|
 | [01](../01-kv-store/), [02](../02-networked-kv-store/) | pre-agreement: the register; processes, links, local concurrency |
-| [03](../03-replicated-kv-store/) | the (1, N) majority-quorum register — what is achievable *without* consensus, and what is not |
-| [04](../04-leader-election/) | ◇P and Ω from heartbeats — partial synchrony, packaged |
-| [05](README.md) | crash consensus (Raft): uniform agreement, majority quorums, crash-recovery |
-| [06](../06-two-phase-commit/) | atomic commitment (2PC): unanimity, blocking, the P-vs-Ω separation |
-| 07 (planned) | **Byzantine reliable broadcast** (Bracha): `3f+1`, echo/ready quorum amplification — the first Byzantine primitive |
-| 08 (planned) | **Byzantine consensus** (PBFT-style): two-phase voting, certificates, view-change |
+| [04](../04-replicated-kv-store/) | the (1, N) majority-quorum register — what is achievable *without* consensus, and what is not |
+| [05](../05-leader-election/) | ◇P and Ω from heartbeats — partial synchrony, packaged |
+| [06](../06-logical-time-broadcast/) (planned) | logical time and the broadcast hierarchy; total-order broadcast ⟺ consensus |
+| [07](README.md) | crash consensus (Raft): uniform agreement, majority quorums, crash-recovery |
+| [08](../08-two-phase-commit/) | atomic commitment (2PC): unanimity, blocking, the P-vs-Ω separation |
+| [10](../10-byzantine-broadcast/) (planned) | **Byzantine reliable broadcast** (Bracha): `3f+1`, echo/ready quorum amplification — the first Byzantine primitive |
+| [11](../11-byzantine-consensus/) (planned) | **Byzantine consensus** (PBFT-style): two-phase voting, certificates, view-change |
+
+(Modules [03](../03-shared-memory-concurrency/), [09](../09-concurrency-control/), and
+[12](../12-crdts-eventual-consistency/) — shared-memory concurrency, concurrency control, and
+eventual consistency/CRDTs — sit off this map's agreement axis; see the
+[course home](../README.md) for the full sequence.)
 
 ## 11. References
 
@@ -308,4 +314,4 @@ arithmetic that provides safety necessarily withholds service from minorities.
   <https://decentralizedthoughts.github.io/2021-10-29-consensus-cheat-sheet/>
 
 ---
-*[Course home](../) · Implementation: [Module 05 — Raft](README.md)*
+*[Course home](../) · Implementation: [Module 07 — Raft](README.md)*

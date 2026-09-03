@@ -110,13 +110,13 @@ which is shared as `Arc<Mutex<Store>>`:
 *operation* lets clients interleave; the same mutex held for the duration of a *connection*
 serializes all clients silently — the service remains correct but is no longer concurrent. This
 implementation locks per operation. (The distinction was discovered here as a live bug, and
-recurs in Module 05 as the rule *never hold a lock across network I/O*.)
+recurs in Module 07 as the rule *never hold a lock across network I/O*.)
 
 **A scope note.** The `Mutex` here is *local* mutual exclusion among threads of one process. It
 is unrelated to CCGR's Chapter 4 "shared memory," which is a *distributed* register emulated over
 message passing among processes that share nothing. CCGR assumes each process handles its events
 mutually exclusively (§1.4.1); the mutex is how a multi-threaded process discharges that
-assumption. Distributed shared memory begins in Module 03. The formal treatment of local
+assumption. Distributed shared memory begins in Module 04. The formal treatment of local
 concurrency — data races, linearizability of a single object, and why a mutex provides it — is
 in [CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md).
 
@@ -141,7 +141,7 @@ simplest form.
 
 ## 5. Limitations and outlook
 
-- **Single node.** No replication; the server is a single point of failure. *(→ Module 03.)*
+- **Single node.** No replication; the server is a single point of failure. *(→ Module 04.)*
 - **No durability.** The store is in-memory only (Module 01's persistence was set aside to focus
   on networking); a restart loses all state. *(→ write-ahead logging; stable storage.)*
 - **One global lock.** Correct but serializing under contention; production systems shard locks
@@ -206,4 +206,5 @@ In the client: `set name Luca`, `get name`, `remove name`; Ctrl+D to quit.
 
 ---
 *[Course home](../) · Previous: [Module 01](../01-kv-store/) · Next:
-[Module 03 — The Replicated Store](../03-replicated-kv-store/)*
+[Module 03 — Shared-Memory Concurrency (planned)](../03-shared-memory-concurrency/) ·
+[Module 04 — Replication and Quorums](../04-replicated-kv-store/)*
