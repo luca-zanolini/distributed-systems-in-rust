@@ -50,9 +50,11 @@ reach this power **two ways**, the same escape in different clothes:
   correct against the detector's *timeless* axioms, and implement the detector *from* timeouts.
 
 > A failure detector is **not** a way to beat asynchrony — ◇P/Ω are **unimplementable** in pure async
-> (that's FLP again). It is the clean *interface* to this escape; the **CHT theorem** (§4) makes it
-> exact: *Ω implementable ⟺ partial synchrony*. Its payoff is **modularity** (CCGR §2.6.1) — a
-> clock-free safety proof, with all the timing quarantined inside Ω's implementation.
+> (that's FLP again). It is the clean *interface* to this escape: **partial synchrony is *sufficient* to
+> implement Ω** (the converse is false — Ω is implementable under strictly weaker timing, e.g. a single
+> eventually-timely link, so it's ⟸ not ⟺). Its payoff is **modularity** (CCGR §2.6.1) — a clock-free
+> safety proof, with all the timing quarantined inside Ω's implementation. *(The CHT result about Ω is a
+> different statement — see §4.)*
 
 **② Add a little *luck* — randomization.** Coin flips break the adversary's grip; this is the **only**
 escape that keeps *full* asynchrony — **Ben-Or 1983**; randomized BFT (HoneyBadgerBFT).
@@ -105,8 +107,12 @@ the same resource*:
 - **◇P / Ω** are *eventually* accurate: wrong for a while, correct after GST. **Ω** ("eventual
   leader") outputs one process that *eventually* all correct nodes agree is up.
 - **The bridge theorem (Chandra–Hadzilacos–Toueg, 1996): Ω is the *weakest* failure detector that
-  solves consensus.** So *consensus is solvable ⟺ you can implement Ω ⟺ you have (at least) partial
-  synchrony.* The timing lens and the detector lens draw the **same** boundary.
+  solves consensus** — *given a majority of correct processes* (f < n/2). (Without the majority
+  assumption the weakest detector is the pair **(Σ, Ω)**, where Σ is the quorum detector.) So, with a
+  correct majority, *consensus is solvable ⟺ you can implement Ω*; and since **partial synchrony is
+  *sufficient* (not necessary) to implement Ω**, partial synchrony ⟹ Ω ⟹ consensus. The timing lens
+  and the detector lens draw essentially the **same** boundary — modulo that Ω needs slightly less
+  than full partial synchrony.
 
 > Slogan: **synchrony → P; partial synchrony → Ω; asynchrony → nothing (FLP).** Detectors are
 > *synchrony, packaged as an oracle.* (Expanded in [`04`'s README](../04-leader-election/README.md).)

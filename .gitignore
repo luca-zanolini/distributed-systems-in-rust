@@ -10,6 +10,16 @@ store.db
 # Raft node persistent state (per-node, runtime)
 raft-*.state
 
+# 2PC participant persistent state (per-node, runtime)
+2pc-*.state
+
+# 2PC demo node logs (runtime)
+demo-*.log
+
+# Python bytecode cache (demo scripts)
+__pycache__/
+*.pyc
+
 # Reference material — personal copies, NEVER committed or pushed (copyright).
 # Books/papers go under reference/; only its README is tracked.
 *.pdf
