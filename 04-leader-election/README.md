@@ -1,235 +1,261 @@
-# 04 — Leader Election
+# Module 04 — Failure Detection and Leader Election
 
-A cluster of nodes that **detects the loss of its leader and elects a new one by majority vote** —
-with no central authority (the one you'd ask is the one that died). Nodes exchange **heartbeats**;
-silence past a **timeout** marks a peer as suspected; each node **votes** for the lowest-id node it
-still sees alive; and a node becomes leader only once a **majority** of votes back it.
+*Part of **Concurrent and Distributed Systems in Rust** ([course home](../)). Reference text:
+**CCGR** (Cachin, Guerraoui & Rodrigues, 2nd ed., 2011). Prerequisites:
+[Module 02](../02-networked-kv-store/), [Module 03](../03-replicated-kv-store/).*
 
-This is the piece `03` was missing — **automatic failover** — and the last rung before **consensus**:
-combine `04`'s election with `03`'s replicated log and you have **Raft**.
-
----
-
-## Theory — failure detection & leader election
-
-### 1. Why elect a leader
-
-Many distributed protocols need **one** node in charge to make progress: a *primary* to order writes
-(`03`), a sequencer, a lock holder, a coordinator. A single fixed leader is simple — but it can
-**crash**, and then everything stalls. Fault tolerance therefore needs two things the group must do
-**for itself**:
-
-1. **Detect** that the leader is gone — even though you can't just "ask" it.
-2. **Agree** on a replacement — without a central authority to appoint one.
-
-That is leader election, and it is exactly what `03` lacked: its primary was fixed by hand, so a
-primary crash was unrecoverable. `04` supplies the missing failover.
-
-### 2. Where it shows up in practice
-
-| Piece | Real systems |
-|---|---|
-| **Heartbeat failure detection** | Kubernetes node heartbeats, **Raft** election timeouts, gossip/**SWIM** (Consul, Serf), Cassandra's φ-accrual detector |
-| **Leader election** | **Raft**/etcd leader, ZooKeeper (ZAB), Kubernetes leader-election leases, the Kafka controller |
-
-Together they are the **control plane** underneath most distributed databases and orchestrators.
-
-### 3. What it precisely is — two abstractions from CCGR Chapter 2 (§2.6)
-
-- **Failure detector** — a module that reports which processes have crashed, *possibly inaccurately*.
-  Heartbeats + a timeout give an **eventually perfect** detector, **◇P** (§2.6.4): it may briefly
-  suspect a slow-but-alive node (a false positive), but **eventually** every crashed node is
-  suspected (*strong completeness*) and it stops suspecting correct ones (*eventual strong
-  accuracy*). Its stricter cousin **P** (§2.6.2) never makes mistakes — but only a **synchronous**
-  system can implement it.
-- **Leader election** — **◇Ω** (§2.6.5): eventually all correct nodes agree on a single correct
-  leader. We build the **monarchical** rule ("the alive node with the smallest id leads"), then make
-  it *safe* by requiring a **majority vote**.
-
-> Why *eventually*, always? Because in an asynchronous / partially-synchronous network you can
-> **never be certain** a node crashed — it might just be slow, or its message delayed (**FLP**,
-> §2.5.1). A timeout is a *guess*. So detection and election are **eventual and self-correcting**,
-> never instant or certain — the deep truth this whole project makes tangible.
-
-### 4. How this project evolved — one problem at a time
-
-Same as `03`: each milestone fixes the wound the last one exposed.
-
-| # | We built… | …which exposed |
-|---|---|---|
-| **M1** | **heartbeats** — every node pings its peers each second | it's just a pulse; nobody yet *reacts* to silence |
-| **M2** | **failure detection** — suspect a peer silent past a 3s timeout (retract on recovery) | now you can spot a crash, but no one is *in charge* — and a suspicion can be *wrong* (◇P, not P) |
-| **M3** | **leader election** — the lowest-id alive node wins (monarchical ◇Ω) | each node decides **locally**, so a lone survivor crowns *itself*, and a partition could crown **two** leaders → **split-brain** |
-| **M4** | **majority-vote election** — each node's vote rides its heartbeat; a leader needs a **quorum** of votes | split-brain gone (two majorities can't both form); but there are no **terms** yet → the door to **Raft** |
-
-The arc: **detect** (M1–M2) → **elect** (M3) → **make election *safe*** with a quorum (M4).
-
-> 🎓 **Three experiments that make it visceral.**
-> 1. **Detection (M2):** kill a node → after ~3s the survivors print `SUSPECT`; restart it → `ALIVE again`. A detector that is *wrong-then-corrects* — exactly ◇P.
-> 2. **Failover (M3/M4):** kill the leader → leadership moves to the next node, *by a fresh majority of votes* — no coordinator, no downtime beyond the timeout.
-> 3. **Split-brain safety (M4):** kill 2 of 3 → the lone survivor tallies only its **own** vote (`1/3`) and **stands down**. M3 would have crowned it; real voting refuses.
-
-### 5. The safety argument (quorum intersection — straight from `03`)
-
-A leader needs a **majority of votes**, and each node casts exactly **one** vote (its current
-`choice`, broadcast on its heartbeat). Because **any two majorities of N nodes share at least one
-node**, and that shared node's single vote backs only one candidate, **two candidates can never both
-reach a majority** → at most one leader. It's the *same* intersection theorem that made `03`'s
-register correct, now applied to leadership — and it is the core idea of **Raft**.
-
-### 6. In the CCGR framework
-
-- **Failure detectors (§2.6):** ours is **◇P** — heartbeats + timeout, encoding a **partial-synchrony**
-  assumption. Perfect **P** (§2.6.2) would need a synchronous system.
-- **Leader election (§2.6.5):** the **monarchical eventual leader detector ◇Ω** (lowest id among the
-  non-suspected), here gated by a majority quorum for safety.
-- **Timing (§2.5):** the 3s timeout *is* the partial-synchrony knob — too short → false suspicions,
-  too long → slow detection. **FLP** (§2.5.1) is why we can only ever be *eventual*.
-- **Links:** heartbeats ride **best-effort** messages — a dropped ping needs no retransmission logic,
-  the next second's ping covers it (closer to *fair-loss* links than the *perfect* links of `02`/`03`).
-- **The ladder:** a failure detector is what circumvents FLP to make consensus solvable — indeed **Ω
-  is the weakest failure detector for consensus** (Chandra–Hadzilacos–Toueg). `04` builds Ω; `05`
-  (Raft) will use it.
-
-### 7. Failure detectors vs. timing models — two lenses on the same thing
-
-You can reason about what a distributed system can *solve* in **two equivalent ways**: directly via
-the **timing model** (synchronous / partially synchronous / asynchronous), or via a **failure
-detector** (P, ◇P, Ω). A failure detector is really just *synchrony packaged as an oracle* — it lets
-you design an algorithm against **axiomatic properties** (no clocks, no timeouts in the proof) and
-implement the detector *separately* from whatever timing the system actually has (CCGR §2.6.1).
-
-| Timing model | Detector you can implement | Consensus? |
-|---|---|---|
-| **Synchronous** | **P** — *perfect*, never wrong (strong accuracy) | yes — even fail-stop, any `f < N` |
-| **Partially synchronous** (GST) | **◇P / ◇Ω** — *eventually* accurate | yes — with a **majority**, `f < N/2` (Paxos, Raft) |
-| **Asynchronous** | none strong enough | **no — FLP** |
-
-- **Perfect FD ≈ synchrony.** With known delay bounds a timeout *never* misfires → strong accuracy.
-  `P` is exactly the crash-detection power a synchronous system buys you.
-- **◇Ω ≈ partial synchrony + GST.** This is DLS's *eventually-synchronous* model: before the
-  (unknown) **Global Stabilization Time**, timeouts can be wrong — false suspicions, even two
-  temporary leaders; *after* GST, delays are bounded, timeouts stop misfiring → **eventual accuracy**
-  → a single stable leader eventually emerges and stays. ◇Ω *is* "eventually one correct leader."
-- **Asynchrony.** You can't implement even ◇Ω deterministically (no eventual bound to lean on) — the
-  failure-detector face of **FLP**.
-
-The two lenses meet in one theorem: **Ω is the *weakest* failure detector that solves consensus**
-(Chandra–Hadzilacos–Toueg, 1996). So *consensus is solvable ⟺ you can implement Ω ⟺ you have at
-least partial synchrony.* This project lives in the **◇P / ◇Ω** regime; Raft (`05`) assumes the same.
-
-> 🎓 Slogan: **synchrony → P; partial synchrony → ◇Ω; asynchrony → nothing (FLP).** Failure detectors
-> are synchrony, packaged as an oracle.
-
-### 8. How the code reflects the theory — and where it stops
-
-| Theory | In this code |
-|---|---|
-| heartbeat | a 1s background thread pinging every peer: `ping <me> <vote>` |
-| failure detector ◇P | `last_heard: HashMap<peer, (Instant, vote)>`; suspect if `elapsed > 3s` |
-| monarchical leader ◇Ω | `choice = min_by_key(port_of)` over the non-suspected nodes |
-| one vote per node | each node's `choice` **rides its heartbeat**; peers record it |
-| majority election | tally votes cast *for me*; lead only if `votes ≥ ⌊N/2⌋+1` |
-
-**Honest limits — the syllabus beyond this project (each a signpost):**
-
-- **No terms.** A node re-votes every round; nothing stops it voting for different candidates over
-  time, so under rapid churn there's a theoretical window. **Raft** adds a monotonic **term** +
-  *vote-once-per-term* to close it. *(→ `05`, Raft.)*
-- **The leader does nothing yet.** It is elected but idle — we don't route work to it. Wiring it into
-  `03` (leader coordinates writes; on failover a new leader takes over) is precisely the combination
-  that **becomes Raft.** *(→ `05`.)*
-- **Fixed timeout (3s).** Real detectors **adapt** to network conditions (φ-accrual, Cassandra). A
-  fixed timeout is a blunt trade of false-positives vs detection speed. *(→ adaptive FD.)*
-- **Static membership.** Peers are hardcoded at launch — no join/leave/discovery. *(→ membership, gossip/SWIM.)*
-- **Crashes, not partitions.** Killing a process is a *crash*; we can't easily simulate a true
-  network *partition* (both sides up, unable to talk). The majority gate is what keeps a partitioned
-  minority from leading, but full asymmetric-partition safety needs the *terms* above.
-- **A fresh TCP connection per heartbeat** — simple but wasteful; real systems reuse connections or use UDP.
+**Abstract.** This module builds a cluster that detects the loss of its leader and elects a
+replacement by majority vote, with no central authority. It introduces **failure detectors**
+(CCGR §2.6) — in particular the eventually perfect detector **◇P**, implemented from heartbeats
+and timeouts — and **leader election**, culminating in the eventual leader abstraction **Ω**.
+Two theoretical points carry the module: first, that under partial synchrony failure detection
+can only ever be *eventually* accurate, because a slow process is indistinguishable from a
+crashed one; second, that a **majority-vote** gate — the same quorum-intersection argument as
+Module 03 — is what prevents two leaders from coexisting (*split-brain*). The module supplies
+exactly the failover capability whose absence limited Module 03, and it constructs the oracle
+(Ω) under which Module 05's consensus algorithm is proved live.
 
 ---
 
-## Run
+## Learning objectives
+
+After completing this module, the reader should be able to:
+
+1. specify the failure detectors **P** and **◇P** by their completeness and accuracy properties,
+   and explain which timing assumptions suffice to implement each;
+2. specify the eventual leader detector **Ω** and implement a monarchical election rule on top of
+   ◇P;
+3. explain why any timeout-based detector must admit false suspicions, and relate this to the
+   impossibility of distinguishing *slow* from *crashed* in an asynchronous system;
+4. define split-brain and prove that requiring a majority of votes, one vote per process,
+   excludes it;
+5. place failure detectors and timing models side by side as two descriptions of the same
+   assumption, and state the role of Ω in the solvability of consensus.
+
+---
+
+## 1. Motivation
+
+Many distributed protocols require a single process to be *in charge* for progress: a primary
+ordering writes (Module 03), a coordinator driving a commit (Module 06), a sequencer, a lock
+service. A fixed leader is simple but mortal; when it crashes, the system must do two things
+**by itself**:
+
+1. **detect** that the leader is gone — although no process can observe another's crash
+   directly; and
+2. **agree** on a replacement — although the authority that would normally appoint one is
+   precisely the process that failed.
+
+These two capabilities — failure detection and leader election — are the control plane beneath
+most replicated systems: Raft's election timeouts, ZooKeeper's leader, Kubernetes leases,
+Kafka's controller, gossip-based membership (SWIM; Consul's Serf) are all instances.
+
+## 2. System model
+
+- **Processes.** `N` nodes `Π = {p₁, …, p_N}`, identified by their network address and totally
+  ordered by an identifier (here: port number). At most `f` may fail, `N ≥ 2f + 1`.
+- **Failures.** Crash-stop. (A crashed-and-restarted node in the demonstrations rejoins as a
+  correct process; the election tolerates this.)
+- **Links.** Heartbeats are sent best-effort over per-message TCP connections; a lost heartbeat
+  is compensated by the next one. The abstraction actually relied on is closer to CCGR's
+  **fair-loss links** than to the perfect links of Modules 02–03 — deliberately, since the
+  protocol is periodic and self-correcting.
+- **Timing: partial synchrony.** Message delays and process speeds are usually bounded, but the
+  bounds are unknown and may hold only eventually (Dwork–Lynch–Stockmeyer). The heartbeat period
+  (1 s) and suspicion timeout (3 s) encode this assumption operationally.
+
+## 3. The abstractions
+
+### 3.1 Failure detectors (CCGR §2.6)
+
+A **failure detector** is a per-process oracle that outputs a set of *suspected* processes. It
+abstracts timing: an algorithm is proved correct against the detector's axioms, and the detector
+is implemented separately from whatever synchrony the network provides.
+
+**Specification (perfect failure detector, P; CCGR §2.6.2).**
+- **PFD1 (Strong completeness).** Eventually, every crashed process is permanently suspected by
+  every correct process.
+- **PFD2 (Strong accuracy).** No process is suspected before it crashes.
+
+**Specification (eventually perfect failure detector, ◇P; CCGR §2.6.4).**
+- **EPFD1 (Strong completeness).** As PFD1.
+- **EPFD2 (Eventual strong accuracy).** Eventually, no correct process is suspected by any
+  correct process.
+
+P never errs, and is implementable only under synchrony (a timeout that provably never misfires
+requires a known delay bound). ◇P may err — it can suspect a slow but correct process — but its
+errors are temporary; heartbeats plus an (adaptable) timeout implement it under partial
+synchrony. The gap between P and ◇P is the operational content of the slogan *a crashed process
+is indistinguishable from a slow one*: without known bounds, any finite timeout can be outwaited
+by an adversarial schedule.
+
+### 3.2 Leader election: the eventual leader detector Ω (CCGR §2.6.5)
+
+**Specification (Ω).** Each process outputs one process it currently *trusts* as leader.
+- **ELD1 (Eventual accuracy).** There is a time after which every correct process trusts some
+  *correct* process.
+- **ELD2 (Eventual agreement).** There is a time after which no two correct processes trust
+  different processes.
+
+Ω does not promise a unique leader at every instant — during unstable periods two processes may
+each consider themselves leader — only that the situation *stabilizes*. This weakness is
+essential: Ω is implementable under partial synchrony, and it is precisely strong enough for
+consensus (§6). The implementation is **monarchical**: each process trusts the smallest-id
+process it does not currently suspect (via ◇P).
+
+### 3.3 The majority gate
+
+A locally computed choice is not yet safe: a process that suspects everyone else would crown
+itself, and a partitioned minority could elect a second leader — **split-brain**. The module
+therefore gates leadership on votes: each process broadcasts, with its heartbeat, the identity
+of the node it currently supports; a node *acts* as leader only while a **majority** of
+processes (counting itself) support it.
+
+**Proposition (no split-brain).** If every process supports at most one candidate at a time and
+acting as leader requires support from `⌊N/2⌋ + 1` processes, then at no time do two processes
+both act as leader on the strength of the same round of support.
+*Proof sketch.* Two majorities intersect (Module 03, quorum-intersection lemma); a process in
+the intersection supports one candidate, not two. ∎
+
+The qualification "same round" is doing real work: because processes re-vote continuously and
+nothing binds a process to its past vote, there are transient schedules in which stale support
+counts overlap. Closing this gap requires making support *epochal* — a monotone term with at most
+one vote per process per term. That refinement is exactly Raft's, and it is the subject of
+Module 05.
+
+## 4. Development of the implementation
+
+| # | Design | Deficiency exposed |
+|---|---|---|
+| M1 | heartbeats: every node pings all peers each second | a pulse with no consumer: nothing yet reacts to silence |
+| M2 | failure detection: suspect a peer silent for > 3 s; retract on contact (◇P) | detection without governance — and suspicion can be wrong, by design |
+| M3 | monarchical election: trust the smallest non-suspected id (Ω) | decisions are purely local: a lone survivor crowns itself; a partition can crown two |
+| M4 | majority-vote gate: votes ride heartbeats; act as leader only with a quorum of support | split-brain excluded; remaining gap: votes are not epochal (no terms) — the door to Raft |
+
+**Experiments** (`demos/`): (i) *Detection:* kill a node — after ~3 s survivors print `SUSPECT`;
+restart it — `ALIVE again`: the detector errs and self-corrects, the observable content of ◇P.
+(ii) *Failover:* kill the leader — support reassembles around the next id within a timeout.
+(iii) *Standing down:* kill two of three — the survivor tallies only its own vote (1/3) and
+refuses leadership; under the M3 design it would have crowned itself.
+
+## 5. Two lenses on one assumption: detectors and timing models
+
+The solvability of agreement can be stated either in terms of the **timing model** or in terms
+of the strongest **failure detector** implementable in it:
+
+| Timing model | Implementable detector | Consensus solvable? |
+|---|---|---|
+| Synchronous | **P** (never errs) | yes, for any `f < N` (crash) |
+| Partially synchronous | **◇P**, **Ω** | yes, with `f < N/2` (Paxos, Raft) |
+| Asynchronous | none of the above | not deterministically — FLP |
+
+The two columns are linked by a fundamental result: **Ω is the weakest failure detector for
+consensus** given a correct majority (Chandra–Hadzilacos–Toueg 1996; without the majority
+assumption, the pair (Σ, Ω) is weakest, where Σ is the quorum detector). Partial synchrony is
+*sufficient* to implement Ω — in fact strictly weaker timing assumptions suffice — and Ω, with a
+majority, suffices for consensus. This module implements Ω; Module 05 consumes it. A fuller
+treatment, including why the failure-detector interface does not extend to Byzantine faults, is
+in [CONSENSUS.md](../05-raft/CONSENSUS.md) §§2–4.
+
+## 6. Correspondence between theory and code
+
+| Concept | Realization |
+|---|---|
+| heartbeat | a 1 s background thread sends `ping <sender> <vote>` to every peer |
+| ◇P | `last_heard: HashMap<peer, (Instant, vote)>`; suspect when `elapsed > 3 s`; retract on contact |
+| Ω (monarchical) | `choice = min_by_key(port)` over non-suspected nodes (self included) |
+| one vote per process | the current `choice` travels on every heartbeat; peers record the latest |
+| majority gate | count peers whose recorded vote names this node (+ own); lead iff `≥ ⌊N/2⌋+1` |
+
+Design notes. Every node runs the identical loop — the protocol is symmetric, periodic, and
+self-stabilizing rather than a one-shot election: each second a node updates suspicions,
+recomputes its choice, broadcasts, tallies, and reports status changes. A single message type
+(`ping`) carries both failure detection and voting. Two clocks govern the module — the 1 s
+period and the 3 s timeout — and the timeout must comfortably exceed the period, or a single
+delayed heartbeat produces a false suspicion. Node identifiers are compared numerically by port
+(`port_of`), not lexicographically.
+
+## 7. Limitations and outlook
+
+- **No terms.** Votes are not epochal; a process may support different candidates over time
+  within one unstable period, leaving transient windows under churn (§3.3). Raft's monotone
+  *term* with one vote per term closes this. *(→ Module 05.)*
+- **The leader has no duties.** It is elected and idle; wiring it to Module 03's replication —
+  leader coordinates writes, failover installs a new coordinator — is precisely the combination
+  that becomes Raft. *(→ Module 05.)*
+- **Fixed timeout.** Production detectors adapt to measured network behavior (e.g. the
+  φ-accrual detector); a fixed 3 s trades false suspicions against detection latency bluntly.
+- **Static membership.** The peer set is fixed at launch; joining, leaving, and discovery are
+  membership problems (gossip, SWIM).
+- **Crashes are simulated by killing processes.** A true network partition (all processes up,
+  communication severed) is not exercised; the majority gate is the mechanism that would contain
+  it, with the caveat of §3.3.
+
+## 8. Exercises
+
+1. **(Detector classification.)** For each modification, state which of EPFD1/EPFD2 (or PFD2)
+   the resulting detector satisfies, and under which timing assumption: (a) the timeout is
+   halved to the heartbeat period; (b) the timeout doubles after every false suspicion;
+   (c) suspicions are never retracted.
+2. **(Accuracy/latency trade-off.)** Instrument the implementation to count false suspicions
+   per hour while injecting artificial delay (e.g. `tc`-style delay or a sleep in the send
+   path). Plot detection latency and false-suspicion rate as functions of the timeout, and
+   identify the regime the 3 s default occupies.
+3. **(Split-brain, precisely.)** Exhibit an execution of the M3 design (no majority gate) with
+   `N = 4` in which two processes simultaneously act as leader. Then show where the same
+   execution is blocked once the majority gate is added.
+4. **(Transient double-support.)** Construct a schedule in which, without terms, stale votes
+   allow a process to *briefly* tally a majority that includes support a peer has already moved
+   elsewhere. Explain which property of Raft's terms (monotonicity, or vote-once-per-term)
+   eliminates the schedule, and why the eventual guarantees of Ω are not violated by it.
+5. **(Ω without ◇P.)** Ω is strictly weaker than ◇P. Sketch an implementation of Ω in a system
+   where only *one* process's links are eventually timely (all others fully asynchronous), and
+   argue that no implementation of ◇P exists there.
+
+## References
+
+**Reference text**
+- C. Cachin, R. Guerraoui, L. Rodrigues, *Introduction to Reliable and Secure Distributed
+  Programming*, 2nd ed., Springer, 2011. For this module: failure detectors and leader election
+  (§2.6: P §2.6.2, ◇P §2.6.4, Ω §2.6.5); timing assumptions (§2.5). ISBN 978-3-642-15259-7.
+
+**Theory**
+- T. D. Chandra, S. Toueg, *Unreliable Failure Detectors for Reliable Distributed Systems*,
+  JACM 43(2), 1996.
+- T. D. Chandra, V. Hadzilacos, S. Toueg, *The Weakest Failure Detector for Solving Consensus*,
+  JACM 43(4), 1996.
+- C. Dwork, N. Lynch, L. Stockmeyer, *Consensus in the Presence of Partial Synchrony*,
+  JACM 35(2), 1988.
+- M. Fischer, N. Lynch, M. Paterson, *Impossibility of Distributed Consensus with One Faulty
+  Process*, JACM 32(2), 1985.
+- M. K. Aguilera, C. Delporte-Gallet, H. Fauconnier, S. Toueg, *On Implementing Omega with Weak
+  Reliability and Synchrony Assumptions*, PODC 2003. (Ω from a single eventually-timely source.)
+
+**Practice**
+- A. Das, I. Gupta, A. Motivala, *SWIM: Scalable Weakly-consistent Infection-style Process Group
+  Membership Protocol*, DSN 2002.
+- N. Hayashibara, X. Défago, R. Yared, T. Katayama, *The φ Accrual Failure Detector*, SRDS 2004.
+- D. Ongaro, J. Ousterhout, *In Search of an Understandable Consensus Algorithm (Raft)*,
+  USENIX ATC 2014.
+
+---
+
+## Running the code
 
 ```bash
-cargo build
-cargo test        # unit tests for port_of (numeric node ordering)
+cargo build && cargo test
 ```
 
-Start a **3-node cluster** — every node lists the *other two* as peers:
+Start a three-node cluster:
 ```bash
 cargo run -- 5000 127.0.0.1:5001 127.0.0.1:5002
 cargo run -- 5001 127.0.0.1:5000 127.0.0.1:5002
 cargo run -- 5002 127.0.0.1:5000 127.0.0.1:5001
 ```
-Each node logs its own view: `SUSPECT …` / `… ALIVE again`, and its leadership status
-`voting for …` / `I AM LEADER (v/n votes)` / `candidate, NO majority …`. Kill the lowest node
-(`Ctrl+C`) and watch leadership fail over to the next.
-
-**Wire protocol** (one line, newline-framed): `ping <sender-addr> <vote-addr>` — a heartbeat that
-*also* carries the sender's current vote. That single message type is the whole protocol.
-
-**Failure demos** (`demos/`) drive a real cluster over TCP:
-
-| Script | Shows |
-|---|---|
-| `failure_detection.py` | kill a node → `SUSPECT`; restart it → `ALIVE again` (◇P: wrong-then-corrects) |
-| `election.py` | failover by majority (`5000 → 5001`), then kill 2 of 3 → the survivor **stands down** (no quorum) |
-
-## Design & notable implementation details
-
-- **Every node runs the identical loop** (no coordinator): each second it (1) updates suspicions from
-  `last_heard`, (2) recomputes its vote `choice`, (3) broadcasts `ping <me> <choice>`, (4) tallies the
-  votes cast for it, (5) logs any status change. Convergence is emergent — it's a **self-stabilizing,
-  steady-state** protocol, not a one-shot election.
-- **Votes ride heartbeats.** Rather than a separate election RPC, each heartbeat carries the sender's
-  current vote; every node keeps peers' latest votes in `last_heard: HashMap<peer, (Instant, vote)>`
-  and counts locally. One message type does both failure detection *and* voting.
-- **Two clocks:** a **1s** period (how often each node acts) and a **3s** timeout (silence → suspect).
-  The timeout must exceed the heartbeat period, or a single late ping causes a false suspicion.
-- **Node id = its address**, ordered by **port number** (`port_of` parses and compares numerically, so
-  `10000 > 9000` — string order would get that backwards).
-- **Concurrency:** the monitor thread and the listener share `last_heard` via `Arc<Mutex<…>>` —
-  *local* shared memory between threads; across nodes there is only message passing.
-
-## What I learned
-
-*Rust:* background threads with **timers** (`Duration`, `thread::sleep`, `Instant::elapsed`),
-sharing state across threads with `Arc<Mutex<HashMap>>` (writer thread + reader thread), tuple map
-values `(Instant, String)`, iterator tools (`min_by_key`, `filter`, `split_whitespace`), `if let
-Ok(..)`/`if let Some(..)` for best-effort I/O, and a small pure helper worth unit-testing (`port_of`).
-
-*Distributed systems:* **failure detection** (heartbeats, timeouts, suspicion) and why it can only be
-**eventually perfect (◇P)** under partial synchrony; **leader election (◇Ω)** and the monarchical
-rule; **split-brain** and how a **majority vote** (quorum intersection, again) prevents it; the
-difference between *seeing* a majority alive and *collecting* a majority of votes; and a concrete feel
-for why this is the doorstep to **consensus / Raft**.
+Each node logs `SUSPECT …` / `… ALIVE again` and its leadership status. Kill the lowest-id node
+and observe failover; the `demos/` scripts (`failure_detection.py`, `election.py`) reproduce the
+experiments of §4.
 
 ---
-
-## References
-
-**Course reference text (the theory spine for the whole repo)**
-- Christian Cachin, Rachid Guerraoui & Luís Rodrigues, *Introduction to Reliable and Secure
-  Distributed Programming*, 2nd ed., Springer, 2011. For `04`: **failure detectors** and **leader
-  election** (Ch. 2, §2.6 — P, ◇P, ◇Ω), **timing assumptions** (§2.5). ISBN 978-3-642-15259-7.
-
-**Failure detectors & the theory of election**
-- Tushar Chandra & Sam Toueg, *Unreliable Failure Detectors for Reliable Distributed Systems*, JACM
-  1996. The foundational theory of failure detectors (P, ◇P, ◇S) — exactly the abstraction M2 builds.
-- Tushar Chandra, Vassos Hadzilacos & Sam Toueg, *The Weakest Failure Detector for Solving Consensus*,
-  JACM 1996. **Ω** — a leader oracle — is the *weakest* detector that makes consensus solvable; `04`
-  is building Ω.
-- Michael Fischer, Nancy Lynch & Michael Paterson, *Impossibility of Distributed Consensus with One
-  Faulty Process (FLP)*, JACM 1985. Why detection/election can only be *eventual*: no deterministic
-  protocol decides in an asynchronous system with even one crash.
-
-**Practice, and where `04` heads next**
-- Abhinandan Das, Indranil Gupta & Ashish Motivala, *SWIM: Scalable Weakly-consistent Infection-style
-  Process Group Membership Protocol*, DSN 2002. Gossip-based failure detection at scale (Consul, Serf).
-- Diego Ongaro & John Ousterhout, *In Search of an Understandable Consensus Algorithm (Raft)*, USENIX
-  ATC 2014. Leader election **with terms** + a replicated log — `04`'s election made complete. The
-  natural next project.
-
----
-Part of [distributed-systems-in-rust](../).
+*[Course home](../) · Previous: [Module 03](../03-replicated-kv-store/) · Next:
+[Module 05 — Consensus: Raft](../05-raft/)*

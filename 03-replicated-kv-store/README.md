@@ -1,286 +1,263 @@
-# 03 — Replicated Key-Value Store
+# Module 03 — Replication and Quorums: The (1, N) Regular Register
 
-`02`'s networked store, now **replicated across several nodes** so it survives crashes. The data
-lives on multiple machines; a write is propagated to a **quorum** of them, and a read consults a
-**quorum** and returns the freshest copy. A crashed node that comes back **catches up** from its
-peers. Step by step this grows into a genuine distributed-systems object — the **(1, N)
-Majority-Voting register** of Cachin, Guerraoui & Rodrigues (*Introduction to Reliable and Secure
-Distributed Programming*, 2nd ed., 2011 — **"CCGR"**), §4.2.3.
+*Part of **Concurrent and Distributed Systems in Rust** ([course home](../)). Reference text:
+**CCGR** (Cachin, Guerraoui & Rodrigues, 2nd ed., 2011). Prerequisites:
+[Module 01](../01-kv-store/), [Module 02](../02-networked-kv-store/).*
 
-This is the capstone of the "storage" arc of the repo: `01` was the **K** and **V**, `02` put it on
-the **network**, and `03` makes it **fault-tolerant**. What it *cannot* yet do points straight at
-the next subject: **consensus**.
+**Abstract.** This module replicates the store of Module 02 across several nodes so that data
+survives crashes. It develops, through a sequence of increasingly strong designs, the **(1, N)
+regular register** implemented by **majority voting** (CCGR §4.2.3): writes are timestamped and
+propagated to a majority **quorum**, reads consult a quorum and return the value with the highest
+timestamp, and correctness rests on the fact that any two majorities intersect. Along the way the
+module demonstrates — experimentally, not only in statement — the tension between consistency and
+availability formalized by the **CAP theorem**, and the **crash-recovery** model with state
+transfer. The register this module completes is the strongest object obtainable *without*
+agreement; the questions it provably leaves open (who is the writer? who succeeds a failed
+writer? what order do concurrent writes take?) motivate Modules 04 and 05.
 
 ---
 
-## Theory — replication, quorums, and the register
+## Learning objectives
 
-### 1. Why replicate
+After completing this module, the reader should be able to:
 
-A single node (project `02`) is a **single point of failure**: if it dies, the data and the service
-die with it. **Replication** keeps copies of the state on several nodes so that (a) the data
-survives the loss of some nodes, and (b) more nodes can serve the load. It is the foundation of
-every fault-tolerant store.
+1. define replication and articulate its two goals (fault tolerance, availability) and its
+   central cost (the consistency of copies);
+2. specify the (1, N) regular register and implement it by majority voting;
+3. state and prove the **quorum intersection lemma** and derive the general condition
+   `R + W > N`;
+4. explain the CAP trade-off as it manifests concretely in synchronous replication to an
+   unreachable replica;
+5. describe crash-recovery with state transfer, and its limitations relative to stable storage;
+6. state precisely why a regular register is weaker than an atomic one, and what the
+   read-impose (write-back) step adds;
+7. enumerate the questions replication cannot answer without agreement.
 
-But replication is not free — the moment there is more than one copy, a cascade of hard questions
-opens up, and *each* is a distributed-systems topic:
+---
 
-- **Consistency** — when do the copies agree? What does a read return if they disagree?
-- **Availability under failure** — if a copy is down or unreachable, do we still accept writes?
-- **Recovery** — a crashed copy restarts having lost everything; how does it become current again?
-- **Ordering / agreement** — if copies can accept operations independently, who decides the order?
+## 1. Motivation
 
-`03` walks straight up this staircase, one milestone per step (see **§4, the evolution**).
+A single node is a single point of failure: if it crashes, the data and the service are lost.
+**Replication** maintains copies of the state on several nodes so that the data survives the loss
+of a subset of them. It is the foundation of every fault-tolerant storage system — and the moment
+there is more than one copy, four questions arise, each a chapter of this course:
 
-### 2. Where this shows up in practice
+- **Consistency.** When do the copies agree, and what may a read return when they do not?
+- **Availability under failure.** If some copies are unreachable, are writes still accepted?
+- **Recovery.** A crashed replica restarts without its volatile state; how does it rejoin?
+- **Ordering.** If operations can originate at several places, who determines their order?
 
-| Style | Real systems |
-|---|---|
-| **Primary/backup** (leader replicates to followers) | PostgreSQL streaming replication, MySQL, Redis replication |
-| **Quorum replication** (`R + W > N`) | **Dynamo**, Cassandra, Riak |
-| **Consensus-backed** (strongly consistent) | **etcd**/ZooKeeper (Raft/ZAB), Spanner (Paxos), CockroachDB/TiKV |
-| **Crash-recovery + catch-up** | Raft snapshot install, Kafka replica bootstrap, Postgres WAL shipping |
+Production systems occupy well-known points in this space: primary/backup replication
+(PostgreSQL, MySQL, Redis), quorum replication with `R + W > N` (Dynamo, Cassandra, Riak),
+consensus-backed replication (etcd, ZooKeeper, Spanner, CockroachDB), and log-shipping recovery
+(Kafka, Postgres WAL shipping). This module builds the quorum-replicated point.
 
-The **CAP theorem** is the fork every one of these must pick a side of; `03` (like etcd/Spanner)
-chooses **C over A** — it refuses to serve without a quorum rather than risk a stale answer.
+## 2. System model
 
-### 3. What it precisely is — the register
+- **Processes.** `N` server processes (nodes) `Π = {p₁, …, p_N}`, pairwise connected; clients
+  are external processes as in Module 02. One distinguished node (the *primary*) performs all
+  writes — the "(1, N)" in the register's name: one writer, `N` readers.
+- **Links.** Perfect point-to-point links (Module 02; provided by TCP).
+- **Failures.** Crash-stop for the running cluster; at most `f` nodes may crash, with
+  `N ≥ 2f + 1` (a majority of nodes remains correct). Milestone M5 additionally admits
+  **crash-recovery** (CCGR §2.2.4): a node may crash, lose its volatile state (*amnesia*), and
+  rejoin via state transfer.
+- **Timing.** Asynchronous. No timing assumption is needed: the register's safety and liveness
+  hold in a fully asynchronous system, which is precisely why registers are obtainable "below"
+  the consensus boundary drawn by FLP (see [CONSENSUS.md](../05-raft/CONSENSUS.md)).
 
-A replicated key-value store is, formally, a set of **read/write registers** — one per key — the
-shared-memory abstraction CCGR develops in **Chapter 4**, emulated over message passing among
-crash-prone nodes. A register has two operations: **read** (`get`) and **write** (`set`).
+## 3. The abstraction: a (1, N) regular register
 
-`03` implements the **(1, N) regular register** by the **"Majority Voting"** algorithm (CCGR §4.2.3):
+**Specification (regular register; CCGR §4.1.2, adapted).** One designated process may invoke
+`write(v)`; any process may invoke `read()`. Assuming the writer invokes operations
+sequentially:
 
-- **(1, N)** — **one writer** (the primary), N readers. One writer is what lets us use a plain
-  integer timestamp with no ties; multiple writers would need vector clocks (see limits).
-- **Majority Voting** — every value carries a **timestamp**; a **write** goes to a majority, and a
-  **read** collects a majority and returns the value with the **highest timestamp**.
+- **RR1 (Termination — liveness).** Every operation invoked by a correct process eventually
+  completes.
+- **RR2 (Validity — safety).** A read returns the value of the last completed write, or of a
+  write concurrent with the read. In particular, a read *not* concurrent with any write returns
+  the last value written.
 
-The correctness rests on one fact you can prove in a sentence — **any two majorities of `N` nodes
-share at least one node** (`⌊N/2⌋+1` + `⌊N/2⌋+1 > N`). So a read-quorum always intersects the
-write-quorum of the last completed write, and that shared node carries the latest value; the
-highest timestamp selects it. This is Dynamo's `R + W > N` in its symmetric, majority/majority form.
+Regularity forbids reading stale values but permits an anomaly under read–write concurrency:
+two sequential reads overlapping one write may return *new-then-old* values. The **atomic**
+(linearizable) register forbids this as well; §6 states what the upgrade requires. The formal
+hierarchy — safe, regular, atomic — is developed in
+[CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md) §3.
 
-> 🎓 **Teaching idea.** The two classic register algorithms are just two points on the `R+W>N`
-> line: **Read-One Write-All** (`W=N, R=1`, CCGR §4.2.2 — cheap reads, fragile writes) and
-> **Majority Voting** (`W=R=⌊N/2⌋+1`, §4.2.3 — tolerant of a crashed minority on both sides). `03`
-> starts life near the first and ends at the second (see §4).
+## 4. Algorithm: majority voting
 
-### 4. How this project evolved — one problem at a time
+Every stored value carries a **timestamp** assigned by the single writer (a plain integer:
+one writer means no ties, which is exactly what "(1, N)" buys; multiple writers would require
+timestamp pairs or vector clocks).
 
-The most useful way to read `03` is as a chain of *"we built X, then noticed problem Y, which
-forced Z."* Every milestone fixes the wound the previous one exposed.
+- **Write(k, v).** The primary increments the timestamp for `k`, applies `(ts, v)` locally,
+  sends `repl ts k v` to all replicas, and completes when a **write quorum** `W = ⌊N/2⌋ + 1`
+  of nodes (counting itself) has acknowledged.
+- **Read(k).** The reading coordinator queries all nodes for their `(ts, value)` pair for `k`,
+  waits for a **read quorum** `R = ⌊N/2⌋ + 1` of replies (counting its own copy), and returns
+  the value with the **highest timestamp**.
 
-| # | We built… | …which exposed |
+**Lemma (quorum intersection).** Any two subsets `Q₁, Q₂ ⊆ Π` with `|Q₁|, |Q₂| ≥ ⌊N/2⌋ + 1`
+satisfy `Q₁ ∩ Q₂ ≠ ∅`.
+*Proof.* `|Q₁ ∩ Q₂| = |Q₁| + |Q₂| − |Q₁ ∪ Q₂| ≥ (⌊N/2⌋+1) + (⌊N/2⌋+1) − N ≥ 1`. ∎
+
+**Correctness sketch (RR2).** Let `write(v)` with timestamp `t` be the last completed write
+before a read begins. Its write quorum `Q_w` holds `(t, v)`. The read's quorum `Q_r` intersects
+`Q_w`, so the read receives at least one reply with timestamp ≥ `t`; timestamps grow only through
+the single writer, so any strictly larger timestamp belongs to a concurrent write. Taking the
+maximum-timestamp reply therefore returns the last completed or a concurrent write — RR2.
+Termination (RR1) holds because at most `f ≤ ⌊N/2⌋` nodes crash, so a quorum of correct nodes
+always exists and eventually replies. ∎
+
+Majority voting is the symmetric point (`R = W = ⌊N/2⌋+1`) of the general condition
+**`R + W > N`**, whose two extremes are instructive: *read-one/write-all* (`R = 1, W = N`;
+CCGR §4.2.2) has the cheapest reads and completely fragile writes; majority voting tolerates a
+crashed minority on both sides. Dynamo-style systems expose `R` and `W` as per-operation knobs
+on this same line.
+
+## 5. Development of the implementation
+
+The implementation was built in six milestones, each exposing the deficiency the next one
+repairs. The sequence itself is the pedagogy: it retraces the design space of replication.
+
+| # | Design | Deficiency exposed |
 |---|---|---|
-| **M1** | **one backup, async replication** — primary forwards each write to a backup | primary replies `OK` *before* the backup confirms → they can **silently diverge** |
-| **M2** | **synchronous replication** — primary waits for the backup's ack, else `ERR` | now if the backup is **down, every write fails**: we traded availability for consistency (**CAP, felt firsthand**). Also: the value is applied locally *before* the ack → **no rollback** |
-| **M3** | **fan-out to N backups** — forward to all, wait for all | waiting for **all** means **any one** dead backup blocks writes — more replicas made us *less* available (ironic!) |
-| **M4** | **quorum writes** — succeed on a **majority** of acks | a write reaches only a majority → a **stale minority** always exists; a quorum-*failed* write is still applied locally (no rollback) |
-| **M5** | **catch-up / anti-entropy** — a restarted node pulls a snapshot (`dump`) and converges | reads still come from **one** node, so a just-recovered or stale node can serve a **stale read**; the snapshot is point-in-time (a small race) |
-| **M6** | **quorum reads** — version values, read a **majority**, take the highest timestamp | the register is complete — but **who is the primary?** what if it **crashes**? who orders **concurrent** writes? → **consensus** |
+| M1 | asynchronous primary→backup forwarding | primary acknowledges before the backup confirms; copies can silently diverge |
+| M2 | synchronous replication (primary waits for the backup's ack) | if the backup is down, *every* write fails: consistency purchased with availability — the CAP trade-off, observed directly |
+| M3 | fan-out to `N` backups, wait for **all** | one crashed backup blocks all writes: more replicas *reduced* availability |
+| M4 | **quorum writes** (majority of acks) | a stale minority always exists; a write that fails its quorum is still applied locally (no rollback — a foreshadowing of atomic commit, Module 06) |
+| M5 | crash-recovery by **state transfer** (`dump` snapshot on restart) | reads still consult one node, so a recovering or bypassed node can serve stale data |
+| M6 | **quorum reads** with timestamps (the complete register) | the remaining questions — writer failover, concurrent writers, all-or-nothing writes — are not answerable by quorums alone |
 
-Read top to bottom, that is the entire logic of replication: *availability vs consistency*
-(M1–M2), *fault tolerance via quorums* (M3–M4), *recovery* (M5), and *consistent reads* (M6). And
-the last cell is the doorway out of this project.
+**Experiments.** The module's demonstrations make three of these observations concrete:
+(i) *CAP (M2):* kill the backup; a synchronous write fails — the system is consistent but
+unavailable, where the M1 design would have acknowledged and diverged. (ii) *Quorum tolerance
+(M4):* of three nodes, kill one — writes succeed on 2/3; kill two — writes are refused
+(`ERR no quorum`). (iii) *Read quorums mask staleness (M6):* restart a node empty; a read served
+*by that node* still returns the latest value, because the node's own stale copy is outvoted by
+the quorum's timestamps.
 
-> 🎓 **Teaching idea — three experiments that make it visceral.**
-> 1. **CAP (M2):** kill the backup, issue a synchronous write → it *fails*. The system is
->    consistent but unavailable. Async (M1) would have said `OK` and diverged.
-> 2. **Quorum tolerance (M4):** 3 nodes, kill one → writes still succeed (2/3); kill two → `ERR no
->    quorum`. The cluster shrugs off a *minority* but never a *majority*.
-> 3. **Read quorum masks staleness (M6):** restart a node **empty**; a `get` on it still returns
->    the latest value (it polls a majority), while `readts` on it shows its own copy is empty.
+**A remark on the role of quorum reads.** With a single *fixed* primary — the configuration this
+module actually runs — the primary applies each write before replicating it and is therefore
+never stale; a read served by the primary alone would already be correct, and the read quorum
+adds nothing. Quorum reads become load-bearing exactly when the *reading coordinator can be
+stale*: after a failover (a replica that missed the last write takes over as primary), or when
+any node may coordinate reads (the configuration of experiment (iii)). This is why the module
+builds the general read path even though its default deployment does not strictly require it —
+and why Module 04 (failover) is what gives it force.
 
-> **⚠️ An honest caveat — quorum reads are redundant *here*.** With a single **fixed** primary
-> (the design `03` actually runs), the primary writes *before* it replicates, so it is **never
-> stale** — a plain read-one from it would always be correct, and the read quorum buys nothing.
-> They become load-bearing only once the **read coordinator can itself be stale**: after
-> **failover** (the primary crashes and a replica that missed the last write takes over), or when
-> **any node** may serve reads. A replica is never fresher than the primary *that coordinated its
-> write* — but it can be fresher than a *different, later* coordinator that missed it. That is why
-> experiment 3 reads from a stale **non-primary** node: `03` builds the correct, general read;
-> project `04` (leader election / failover) is what gives it a reason to exist.
+## 6. From regular to atomic
 
-### 5. The open questions `03` leaves — and why they need consensus
+Majority voting as implemented yields a **regular** register. The **atomic** (linearizable)
+register additionally requires that once some read returns a value, no later read returns an
+older one — ruling out the new-then-old anomaly among reads concurrent with a write. The standard
+repair is **read-impose** ("write-back", CCGR §4.3): before returning, a reader writes the
+winning `(ts, v)` back to a quorum, ensuring every subsequent quorum intersects a set that has
+seen it. This implementation deliberately omits the write-back; Exercise 3 adds it. The general
+result that single-register reads and writes — but *not* arbitrary read-modify-write objects —
+are implementable wait-free in asynchronous crash-prone systems is due to Attiya, Bar-Noy and
+Dolev (the **ABD** algorithm), which majority voting closely follows.
 
-Even as a finished register, `03` cannot answer several questions, and **each is a consensus
-problem**:
+## 7. Correspondence between theory and code
 
-- **Who is the primary, and who takes over if it crashes?** Ours is fixed by hand. Automatic
-  **failover** requires the nodes to *agree* on a leader → **leader election** (CCGR §2.6, eventual
-  leader `Ω`; the heart of **Raft**).
-- **How do we order concurrent writes from different clients/writers?** One writer sidesteps this;
-  many writers need agreement on a **total order** of operations → **total-order broadcast /
-  replicated state machine** (CCGR Ch. 6), which is *equivalent* to consensus.
-- **How do we make a write all-or-nothing?** A quorum-failed write is applied-and-not-rolled-back.
-  Making it atomic is **(non-blocking) atomic commit / 2PC** (CCGR Ch. 6).
-- **Can we do all this when nodes may *lie*, not just crash?** That is **Byzantine** fault
-  tolerance and the `>2/3` supermajority — a different quorum, a harder problem.
-- **When is agreement even *possible*?** Under full asynchrony, **FLP** says deterministic
-  consensus is impossible with even one crash; you need partial synchrony, randomization, or
-  failure detectors.
-
-These are the subject of the **future consensus project(s)** (`04+`), where a dedicated capstone
-README will map the whole landscape (impossibility, timing models, majority vs `2/3`) — see the
-repo's standing plan. `03` is exactly the rung of the ladder where you *feel* why consensus is
-needed before you build it.
-
-### 6. In the CCGR framework (the book's language)
-
-- **The object:** the **(1, N) regular register**, implemented by **Majority Voting** (§4.2.3);
-  the extreme it started from is **Read-One Write-All** (§4.2.2). Quorums are §2.7.3.
-- **Failure models:** we assume **crash-stop** (§2.2.2) for the running cluster, and step into
-  **crash-recovery** (§2.2.4) at M5 — a node crashes, loses volatile state (**amnesia**), and
-  recovers by **state transfer** (our `dump`/catch-up) instead of stable storage.
-- **Links:** node-to-node messaging rides **perfect point-to-point links** (Module 2.3), which TCP
-  provides (as in `02`).
-- **Safety vs liveness (§2.1.3):** "a read never returns a value older than the latest completed
-  write" is safety; "a write to a reachable majority eventually completes" is liveness. Choosing to
-  **refuse without a quorum** keeps safety at the cost of liveness under partition — the CAP choice.
-- **Honest gap to *atomic*:** Majority-Voting gives a **regular** register. Full **atomic
-  (linearizable)** reads need the reader to *write the winning value back* to a majority before
-  returning (CCGR §4.3, "Read-Impose Write-Majority") — we do **not** do that write-back, so
-  concurrent reads during an in-flight write could momentarily disagree.
-
-### 7. How the code reflects the theory — and where it deliberately stops
-
-| Theory | In this code |
+| Concept | Realization |
 |---|---|
-| replicated **register**, versioned | `Store::map: HashMap<String, (u64, String)>` — `(timestamp, value)` per key |
-| **write** to a quorum | `set` applies locally, forwards `repl <ts> k v` to peers, needs a majority of acks |
-| **read** from a quorum | `get` polls `readts` from a majority, returns the max-`ts` value, else `ERR no read quorum` |
-| single **(1, N)** writer, timestamps | `Store::next_ts` = stored ts + 1, assigned by the primary under one lock |
-| **crash-recovery** state transfer | `--catch-up <primary>` pulls `dump` (a stream of `repl` lines) and applies it before serving |
+| versioned register per key | `Store::map: HashMap<String, (u64, String)>` — `(timestamp, value)` |
+| single writer, monotone timestamps | primary assigns `next_ts` (stored ts + 1) under one lock |
+| write quorum | `set`: apply locally, forward `repl ts k v`, await majority of acks |
+| read quorum | `get`: poll `readts k` from a majority, return the max-timestamp value |
+| crash-recovery state transfer | `--catch-up <addr>`: pull a `dump` snapshot, apply, then serve |
+| CP behavior under partition | refuse writes/reads without a quorum (`ERR no quorum`) |
 
-**Honest limits — the syllabus beyond this project (each a signpost):**
+Wire protocol (newline-framed): `set k v` / `get k` / `remove k` (client);
+`repl ts k v` (primary → replica; terminal — a replica never re-forwards);
+`readts k` → `ts value` or `none` (read quorum); `dump` → the store as `repl` lines
+(state transfer, reusing the replication apply path).
 
-- **No failover — so quorum reads are redundant *today*.** The primary is fixed; if it dies, no one
-  is elected. And because a fixed primary is never stale, a read-one from it would already be
-  correct — the **read quorum only pays off once the coordinator can be stale** (failover, or reads
-  served by any node). *(→ leader election, Raft.)*
-- **Single writer.** Keeps timestamps tie-free; multiple writers need vector clocks / an `(N,N)`
-  register. *(→ CCGR §4.4, Dynamo's conflict resolution.)*
-- **`remove` is not versioned → needs tombstones.** A delete just drops the key, so a stale replica
-  can **resurrect** it under a quorum read. Correct deletion writes a *tombstone* `(ts, ⊥)`.
-  *(→ Dynamo tombstones.)*
-- **Catch-up is a point-in-time snapshot.** A write arriving mid-catch-up can be missed (small
-  race). *(→ log-based catch-up: snapshot + log cutoff, à la Raft.)*
-- **No stable storage.** A node acks a write it holds only in memory; a crash loses it (amnesia).
-  Real durability **logs before acking**. *(→ CCGR §4.5 logged register; `01`'s persistence.)*
-- **Regular, not atomic.** No read-write-back. *(→ CCGR §4.3.)*
-- **No agreement on order / no consensus.** *(→ projects `04+`.)*
+## 8. Limitations and outlook
 
----
+- **No failover.** The primary is fixed; its crash halts writes permanently. Electing a
+  replacement requires the cluster to *agree* on one — leader election. *(→ Module 04.)*
+- **Single writer.** Multiple writers need timestamp pairs (rank, counter) or vector clocks, and
+  a rule for concurrent-write resolution. *(→ CCGR §4.4; Dynamo's sibling design.)*
+- **Deletion is not versioned.** `remove` drops the key outright, so a stale replica can
+  *resurrect* it through a later read quorum; correct deletion writes a **tombstone** `(ts, ⊥)`.
+  *(→ Exercise 2.)*
+- **Snapshot catch-up races with writes.** A write arriving during `dump` transfer can be missed;
+  log-based catch-up (snapshot + log suffix) closes the race. *(→ Module 05's log.)*
+- **No stable storage.** A node acknowledges writes held only in memory; a crash after ack loses
+  them. Durable acknowledgment requires logging to stable storage first. *(→ CCGR §4.5;
+  Modules 05–06.)*
+- **Regular, not atomic.** No read-impose. *(→ Exercise 3.)*
+- **No agreement.** Ordering concurrent operations, all-or-nothing multi-node writes, and
+  writer succession all require consensus or atomic commit. *(→ Modules 04–06.)*
 
-## Run
+## 9. Exercises
 
-Build and test:
-```bash
-cargo build
-cargo test        # unit tests for the versioned Store
-```
-
-Start a **3-node cluster** — every node lists the *other two* as peers (needed so any node can form
-a read quorum):
-```bash
-cargo run -- 4000 127.0.0.1:4001 127.0.0.1:4002   # node A
-cargo run -- 4001 127.0.0.1:4000 127.0.0.1:4002   # node B
-cargo run -- 4002 127.0.0.1:4000 127.0.0.1:4001   # node C
-```
-Talk to node A with the bundled client (it connects to `127.0.0.1:4000`):
-```bash
-cargo run --bin client
-> set name luca
-OK
-> get name
-luca
-```
-
-**Wire protocol** (newline-framed, same channel for clients and replicas):
-
-| Command | From | Meaning |
-|---|---|---|
-| `set <k> <v…>` | client | write; primary assigns a ts, replicates, needs a write quorum |
-| `get <k>` | client | read; polls a majority, returns the highest-ts value |
-| `remove <k>` | client | delete (best-effort, not versioned) |
-| `repl <ts> <k> <v…>` | primary → replica | apply a versioned write (terminal — not re-forwarded) |
-| `readts <k>` | reader → replica | reply `<ts> <value>` or `none` (for a read quorum) |
-| `dump` | recovering node → peer | reply with the whole store as `repl …` lines + `END` |
-
-**Failure demos** (Python scripts drive real sockets against the binary):
-
-- Quorum writes — kill a backup, watch writes survive on a majority and fail without one.
-- Catch-up — kill a node, write while it's down, restart with `--catch-up`, watch it converge.
-- Read quorum — restart a node **empty**, then read *from it* and get the latest anyway.
-
-Restart a crashed node so it catches up first:
-```bash
-cargo run -- 4002 127.0.0.1:4000 127.0.0.1:4001 --catch-up 127.0.0.1:4000
-```
-
-## Design & notable implementation details
-
-- **Roles.** Any node can coordinate; by convention clients **write to one node** (the primary,
-  keeping timestamps tie-free) but may **read from any** node. A node's positional args are its
-  **peers**; `--catch-up <addr>` pulls a snapshot at startup.
-- **Versioned store.** Values are `(u64, String)`. `next_ts` derives the next timestamp from the
-  stored one — no separate counter, so it survives catch-up for free. Timestamp assignment
-  (`next_ts` then `write`) is done **under a single lock** so two concurrent `set`s can't collide.
-- **Replication carries the timestamp.** A backup must store the *same* `(ts, value)` the primary
-  chose, so writes are forwarded as `repl <ts> k v` (not the raw `set` line). The `repl` verb is
-  **terminal**: a replica applies it and never re-replicates. `dump` emits the store as `repl`
-  lines, so catch-up reuses the exact same apply path.
-- **Quorum arithmetic.** `total = peers + 1`, `quorum = ⌊total/2⌋ + 1`. Writes count the primary's
-  own copy as one ack; reads count the coordinator's own copy as one response.
-- **Concurrency.** Thread-per-connection, store behind `Arc<Mutex<…>>`, locked per operation
-  (as in `02`).
-
-## What I learned
-
-*Rust:* tuples as map values and destructuring them (`(ts, value)`), `Option`/`match`/`if let`,
-iterator adapters (`splitn`, `strip_prefix`, `max_by_key`), a small hand-rolled arg parser
-(`while let` over an iterator), `String` building, and reusing `Arc`/`Mutex`/threads/`TcpStream`
-from `02`. Compiler-error-driven refactoring (change the data model, let `rustc` list every call
-site) and `cargo fmt`.
-
-*Distributed systems:* **replication** and the **CAP** trade-off (experienced, not just stated);
-**quorums** and the majority-intersection argument for **both** writes and reads; the **register**
-abstraction and **`R + W > N`**; **versioning/timestamps** and why a single writer keeps them
-simple; **crash-recovery**, **amnesia**, and **anti-entropy** (catch-up); **safety vs liveness**
-and the **CP** choice; and a concrete feel for exactly which questions require **consensus**.
-
----
+1. **(Quorum arithmetic.)** Generalize the lemma of §4: for read and write quorums of sizes
+   `R` and `W`, prove that `R + W > N` is necessary and sufficient for every read quorum to
+   intersect every write quorum. For `N = 5`, list all `(R, W)` on the boundary and discuss the
+   operational meaning of the extremes.
+2. **(Tombstones.)** Implement versioned deletion: `remove` writes `(ts, ⊥)` through the normal
+   write path, reads treat ⊥ as absence, and a compaction pass eventually discards old
+   tombstones. What goes wrong if a tombstone is compacted away while some replica still holds
+   the older live value?
+3. **(Atomic register.)** Add read-impose: a read writes its winning `(ts, v)` to a write quorum
+   before returning. Construct an execution of the *current* code exhibiting the new-then-old
+   anomaly (two sequential reads during one write), and argue that read-impose eliminates it.
+4. **(CAP, precisely.)** In the M2 configuration (one backup, synchronous), state exactly which
+   property from the specification of §3 is sacrificed when the backup is unreachable, and which
+   would be sacrificed by the M1 design instead. Relate both to Gilbert & Lynch's formalization.
+5. **(Amnesia.)** Devise an execution in which a node acknowledges a write, crashes, recovers
+   via `--catch-up` from a peer that was *not* in that write's quorum, and the write is
+   subsequently lost by a full-cluster read — despite quorums being used throughout. Which
+   assumption of §2 does this violate, and what repairs it?
 
 ## References
 
-**Course reference text (the theory spine for the whole repo)**
-- Christian Cachin, Rachid Guerraoui & Luís Rodrigues, *Introduction to Reliable and Secure
-  Distributed Programming*, 2nd ed., Springer, 2011. For `03`: **registers** and the **Majority
-  Voting (1, N) regular register** (Ch. 4, §4.2.3), **quorums** (§2.7.3), **crash-recovery** and
-  stable storage (§2.2.4), and the road ahead in **consensus** (Ch. 5–6). ISBN 978-3-642-15259-7.
+**Reference text**
+- C. Cachin, R. Guerraoui, L. Rodrigues, *Introduction to Reliable and Secure Distributed
+  Programming*, 2nd ed., Springer, 2011. For this module: registers and their hierarchy (Ch. 4);
+  majority voting (§4.2.3); read-one/write-all (§4.2.2); read-impose (§4.3); quorums (§2.7.3);
+  crash-recovery (§2.2.4). ISBN 978-3-642-15259-7.
 
-**Quorum replication & consistency**
-- Giuseppe DeCandia et al., *Dynamo: Amazon's Highly Available Key-value Store*, SOSP 2007. The
-  archetype of quorum replication: `R + W > N`, versioning (vector clocks), hinted handoff, and
-  Merkle-tree anti-entropy — the production versions of what `03` does by hand.
-  <https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf>
-- Seth Gilbert & Nancy Lynch, *Brewer's Conjecture and the Feasibility of Consistent, Available,
-  Partition-Tolerant Web Services*, ACM SIGACT News, 2002. The formal **CAP theorem** — the choice
-  `03` makes (C over A) when a quorum is unreachable.
+**Quorum replication**
+- H. Attiya, A. Bar-Noy, D. Dolev, *Sharing Memory Robustly in Message-Passing Systems*,
+  JACM 42(1), 1995. (The ABD emulation of atomic registers over message passing.)
+- D. K. Gifford, *Weighted Voting for Replicated Data*, SOSP 1979. (The origin of quorum
+  intersection for replication.)
+- G. DeCandia et al., *Dynamo: Amazon's Highly Available Key-value Store*, SOSP 2007.
 
-**Where `03` points next (consensus)**
-- Diego Ongaro & John Ousterhout, *In Search of an Understandable Consensus Algorithm (Raft)*,
-  USENIX ATC 2014. Leader election + a replicated log + snapshot install — the answers to the open
-  questions in §5. etcd is "a KV store on Raft."
-- Leslie Lamport, *The Part-Time Parliament* / *Paxos Made Simple*, 1998/2001. The original
-  consensus algorithm.
-- Michael Fischer, Nancy Lynch, Michael Paterson, *Impossibility of Distributed Consensus with One
-  Faulty Process (FLP)*, JACM 1985. Why agreement is fundamentally hard: no deterministic protocol
-  guarantees consensus in an asynchronous system with even one crash.
-- Fred Schneider, *Implementing Fault-Tolerant Services Using the State Machine Approach*, ACM
-  Computing Surveys, 1990. Replicated state machines and their equivalence to total-order broadcast.
+**Consistency vs. availability**
+- S. Gilbert, N. Lynch, *Brewer's Conjecture and the Feasibility of Consistent, Available,
+  Partition-Tolerant Web Services*, ACM SIGACT News 33(2), 2002.
+
+**Toward agreement**
+- M. Fischer, N. Lynch, M. Paterson, *Impossibility of Distributed Consensus with One Faulty
+  Process*, JACM 32(2), 1985.
+- F. Schneider, *Implementing Fault-Tolerant Services Using the State Machine Approach*,
+  ACM Computing Surveys 22(4), 1990.
+- D. Ongaro, J. Ousterhout, *In Search of an Understandable Consensus Algorithm (Raft)*,
+  USENIX ATC 2014.
 
 ---
-Part of [distributed-systems-in-rust](../).
+
+## Running the code
+
+```bash
+cargo build && cargo test
+```
+
+Start a three-node cluster (each node lists the other two as peers):
+```bash
+cargo run -- 4000 127.0.0.1:4001 127.0.0.1:4002
+cargo run -- 4001 127.0.0.1:4000 127.0.0.1:4002
+cargo run -- 4002 127.0.0.1:4000 127.0.0.1:4001
+```
+Interact via the bundled client (`cargo run --bin client`); restart a crashed node with
+`--catch-up 127.0.0.1:4000` so it performs state transfer before serving. The `demos/` scripts
+drive the three experiments of §5 against real sockets.
+
+---
+*[Course home](../) · Previous: [Module 02](../02-networked-kv-store/) · Next:
+[Module 04 — Failure Detection and Leader Election](../04-leader-election/)*

@@ -1,144 +1,216 @@
-# 01 — Key-Value Store
+# Module 01 — The Key-Value Store: State, Durability, and the Register
 
-A persistent key-value store with an interactive command-line REPL. This is the first
-project in the repo and the foundation the later ones build on: nearly every distributed
-store (Redis, etcd, DynamoDB, Cassandra, TiKV) is, at its core, a key-value store with
-distribution and fault-tolerance layered on top.
+*Part of **Concurrent and Distributed Systems in Rust** ([course home](../)). Reference text:
+Cachin, Guerraoui & Rodrigues, "Introduction to Reliable and Secure Distributed Programming",
+2nd ed., Springer 2011 — cited throughout as **CCGR**. Prerequisites: none.*
+
+**Abstract.** This module builds a persistent key-value store with an interactive command-line
+interface, and uses it to introduce three ideas the entire course rests on: the **register** as
+the elementary shared-storage abstraction (CCGR Ch. 4), **stable storage** and the distinction
+between volatile and durable state (CCGR §2.2.4), and the observation that nearly every
+distributed storage system — Redis, etcd, DynamoDB, Cassandra, TiKV — is a key-value store with
+distribution and fault tolerance layered on top. The implementation is deliberately single-process
+and failure-free; every property that holds trivially here becomes a theorem to be earned in the
+later modules.
 
 ---
 
-## Theory — the key-value store in distributed systems
+## Learning objectives
 
-### 1. Why we start distributed storage with the key-value store
+After completing this module, the reader should be able to:
 
-A key-value (KV) store is the simplest non-trivial storage abstraction: a map from
-**keys** to **values**, with three operations — `get`, `put`, `delete`. That simplicity is
-exactly *why* it is the right starting point for a distributed-systems course.
+1. define the key-value data model and explain why its simplicity makes it the canonical object
+   of study for distributed storage;
+2. define a **read/write register** and state why, in a single-process failure-free execution,
+   the implementation trivially satisfies its sequential specification;
+3. distinguish **volatile** from **stable** storage, define the **crash-recovery** failure model
+   informally, and explain the role of stable storage in it;
+4. identify the durability, crash-safety, and distribution properties this implementation does
+   *not* provide, and name the technique that provides each.
 
-The data model is trivial — it is a dictionary. So when you make it *distributed*, **all of
-the remaining difficulty is distribution itself**: durability, failure, partitioning,
-replication, consistency, ordering, consensus. Nothing is hidden inside a complicated data
-model (as it would be with, say, SQL and query planning). The KV store therefore isolates
-the distributed-systems problems and lets you study them one at a time.
+---
 
-> One-sentence framing for a class: **"A distributed key-value store is a distributed
-> `HashMap` — and that single word *distributed* is the entire course."**
+## 1. Motivation: why a course on distributed systems begins with a dictionary
 
-It is also the *minimal building block* of larger systems: relational databases, file
-systems, message queues, and coordination services can all be built on top of a KV store.
+A key-value (KV) store is the simplest non-trivial storage abstraction: a map from **keys** to
+**values** supporting `get`, `put`, and `delete`. That simplicity is methodological, not
+incidental. Because the data model is trivial, making the store *distributed* isolates precisely
+the difficulties that are inherent to distribution itself — durability, failure, replication,
+consistency, ordering, agreement — with nothing hidden inside a complex data model or query
+language. The KV store therefore serves as the course's *model organism*: each module adds one
+distribution concern to the same object.
 
-### 2. Where KV stores are used in practice, and why they matter
-
-KV stores are the **substrate of modern cloud infrastructure**:
+The abstraction also matters in practice. KV stores are the substrate of modern infrastructure:
 
 | System | Role | Consistency stance |
 |---|---|---|
-| **Redis**, **Memcached** | in-memory cache, sessions, rate-limiters | (usually) single-node / weak |
-| **etcd**, **ZooKeeper**, **Consul** | cluster config, service discovery, locks, leader election | **strong** (consensus-backed) |
-| **DynamoDB**, **Cassandra**, **Riak** | always-writable data at massive scale | **eventual** (highly available) |
-| **RocksDB**, **LevelDB**, **Bitcask** | embedded storage *engine* inside bigger databases | single-node engine |
+| Redis, Memcached | in-memory cache, sessions, rate limiting | single-node / weak |
+| etcd, ZooKeeper, Consul | cluster configuration, service discovery, locks, leader election | strong (consensus-backed) |
+| DynamoDB, Cassandra, Riak | highly available storage at scale | eventual |
+| RocksDB, LevelDB, Bitcask | embedded storage engines inside larger databases | single-node engine |
 
-Why it matters: this abstraction runs the backbone of the internet. **Kubernetes keeps its
-entire cluster state in etcd.** Amazon's shopping cart was the motivating use case for
-**Dynamo.** **TiKV** and **CockroachDB** are distributed KV stores that expose SQL on top.
-Understand the KV store's tradeoffs and you understand the core of cloud infrastructure.
+Kubernetes stores its entire cluster state in etcd; Amazon's Dynamo was designed around the
+shopping-cart workload; TiKV and CockroachDB expose SQL over a distributed KV core. The tradeoffs
+of this one abstraction span the design space of cloud storage.
 
-### 3. What a key-value store actually is
+## 2. System model
 
-**Data model:** an associative array / dictionary — `key → value`, where both are typically
-opaque byte strings.
+This module uses the degenerate case of the course's system model, stated here so that later
+modules can strengthen it incrementally.
 
-**Core operations:** `get(k) → value?`, `put(k, v)`, `delete(k)`; ordered stores add `scan`
-(range queries).
+- **Processes.** A single process executes a sequence of steps; there is no concurrency and no
+  message passing.
+- **Failures.** None are tolerated. (The persistence mechanism gestures at the **crash-recovery**
+  model — a process may stop and later restart, losing volatile state — but this module does not
+  yet handle a crash at an arbitrary point; see §6.)
+- **Timing.** Irrelevant with a single process; timing models become meaningful in Module 02.
 
-The moment you go beyond a single in-memory map, two hard axes appear:
+From Module 02 onward the model becomes: a static set of `N` processes
+`Π = {p₁, …, p_N}` communicating by message passing over a network, with an explicit failure
+model (crash-stop, crash-recovery, or Byzantine) and an explicit timing model (synchronous,
+partially synchronous, or asynchronous).
 
-- **(a) Storage engine — single-node durability & performance.** How do bytes reach disk and
-  get indexed? Common designs, from simplest to most sophisticated:
-  - *in-memory hash map* — fastest, but volatile (lost on crash);
-  - *append-only log + in-memory index* (**Bitcask**) — fast writes, bounded lookups;
-  - *log-structured merge-tree* (**LSM-tree**: LevelDB/RocksDB/Cassandra) — write-optimized;
-  - *B-tree* — read-optimized, the classic database index.
-- **(b) Distribution — when one machine is not enough, or can fail:**
-  - *partitioning / sharding* — split keys across nodes (**consistent hashing**; Dynamo, Chord);
-  - *replication* — keep copies so data survives node loss;
-  - *consistency* — when replicas disagree, what does a read return? **strong/linearizable**
-    vs **eventual**. The **CAP theorem** says that under a network partition you must choose
-    **C**onsistency *or* **A**vailability — you cannot have both;
-  - *ordering & consensus* — to keep replicas in agreement you need agreement on the *order*
-    of operations, i.e. **consensus** (Paxos, Raft). etcd is literally "a KV store on Raft."
+## 3. The abstraction: a register
 
-So "KV store" spans a spectrum from a single in-memory `HashMap` to a globally-replicated,
-consensus-backed, partitioned system — **the same tiny API, wildly different engineering.**
+The elementary object of shared storage is the **read/write register** (CCGR Ch. 4). A register
+stores a value and offers two operations:
 
-### 4. Teaching notes — the KV store as a lens on the whole course
+- `read() → v` — returns the current value;
+- `write(v)` — replaces the value.
 
-- **The staircase.** A KV store is "just a `HashMap`" until you add **durability**, then
-  **crash-safety**, then **networking**, then **replication**, then **consistency**, then
-  **consensus** — and *each step is a chapter of distributed systems.* This repo climbs that
-  staircase one project at a time.
-- **The log is fundamental.** Append-only logs underlie Bitcask, LSM-trees, replication, and
-  consensus. "The log" is arguably *the* central abstraction of distributed systems.
-- **Order is not free.** A `HashMap` iterates in *random* order (see below) — a first hint
-  that, once distributed, *ordering* is something you must actively impose (logical clocks,
-  consensus), never assume.
-- **CAP is a design fork, not a bug.** Every real system picks a side: Dynamo/Cassandra
-  choose availability (AP); etcd/Spanner choose consistency (CP).
-- **Formats evolve.** Changing how you serialize data breaks old files — real systems
-  version their on-disk formats and ship migrations.
+Its **sequential specification** is: *a read returns the value written by the most recent
+preceding write* (or an initial value ⊥ if none exists). A key-value store is a collection of
+registers, one per key; `get(k)` is a read of register `k`, `set(k, v)` a write, and
+`remove(k)` a write of a distinguished empty value.
 
-### 5. How *this* project reflects the theory (and where it deliberately stops)
+In this module there is one process, no concurrency, and no failure, so every execution is
+sequential and the implementation satisfies the sequential specification by construction. The
+substance of register theory — and of Modules 03 onward — is preserving this specification when
+the register is **replicated** across processes that fail and messages that are delayed:
+the *regular* and *atomic* (linearizable) register conditions of CCGR §4.1 are exactly graded
+weakenings and restorations of the sequential specification under concurrency. Module 03
+constructs a fault-tolerant register; the theory companion
+[CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md) develops the consistency
+conditions formally.
 
-| Theory | In this code |
+## 4. Durability and stable storage
+
+A process's memory is **volatile**: its contents do not survive a crash. **Stable storage**
+(CCGR §2.2.4) is an abstraction offering `store` and `retrieve` operations whose effects persist
+across crashes; it is what allows an algorithm designed for crash-stop failures to be lifted into
+the **crash-recovery** model, where a process may crash, lose its volatile state (*amnesia*), and
+rejoin. In practice stable storage means a file system with explicit flushing (`fsync`), and the
+discipline that matters is *when* state reaches disk relative to the messages a process sends —
+a point this course returns to repeatedly (Modules 05 and 06 both depend on it, under the slogan
+*persist before you externalize*).
+
+This module implements the weakest useful form of durability: the store is serialized to disk
+(`store.db`, JSON via `serde`) when the user exits, and reloaded on startup. Data therefore
+survives an orderly restart but not a crash — a distinction made precise in §6.
+
+Two further observations that recur throughout the course:
+
+- **The log is fundamental.** Append-only logs underlie single-node engines (Bitcask, LSM-trees),
+  replication streams, write-ahead logging, and the replicated log at the heart of consensus
+  (Module 05). The whole-file rewrite used here is the baseline against which the log is the
+  improvement.
+- **Serialization formats are contracts.** Changing the on-disk format breaks previously written
+  files; production systems version their formats and provide migrations. (This project switched
+  formats once during development and paid exactly this cost.)
+
+## 5. Implementation
+
+### 5.1 Structure
+
+- **`Store`** — a wrapper over `HashMap<String, String>` exposing `set` / `get` / `remove`.
+- **REPL** — reads a line from stdin, tokenizes it, and dispatches via a `match` on a slice
+  pattern (`["set", key, rest @ ..]`, `["get", key]`, …).
+- **Persistence** — `serde` + `serde_json` serialize the map to `store.db`; `load` treats a
+  missing file as an empty store (first run).
+
+### 5.2 Correspondence between theory and code
+
+| Concept | Realization |
 |---|---|
-| KV **data model** | `Store` = a `HashMap<String, String>` with `set` / `get` / `remove` |
-| simplest **storage engine** | the in-memory `HashMap` — fastest and most volatile (the "before durability" baseline) |
-| **durability** | `save`/`load` to `store.db`: rewrite the whole file on exit, reload on startup |
-| **serialization** + **format migration** | `serde` + JSON; switching from the old tab format broke old files — the migration lesson, felt firsthand |
-| a **client interface** | the REPL — a stand-in for the network clients that arrive in `02` |
+| register per key (sequential specification) | `Store` over `HashMap<String, String>`; single-threaded access |
+| volatile state | the in-memory map |
+| stable storage (weak form) | `save`/`load` of `store.db` on exit/startup |
+| serialization and format evolution | `serde` JSON; a format change during development required a migration |
+| client interface | the REPL — a stand-in for the network clients of Module 02 |
 
-**Honest limits (these are the syllabus for later, not accidents):**
+### 5.3 Notes on the Rust implementation
 
-- **Not crash-safe** — we save only on `exit`, so a crash before then loses everything. Real
-  engines append to a write-ahead log and `fsync`. *(→ crash recovery, the log.)*
-- **O(n) per save** — we rewrite the entire file every time. *(→ append-only logs, LSM-trees.)*
-- **Single process** — no network, no clients over a socket. *(→ project `02`, TCP.)*
-- **No replication, partitioning, consistency model, or consensus.** *(→ projects `03+`.)*
+- **Ownership expresses intent:** `get` borrows (`Option<&String>`); `remove` returns an owned
+  `String`, because the map relinquishes the value.
+- **Multi-word values:** the slice-rest pattern (`rest @ ..`) with `join(" ")` admits values
+  containing spaces.
+- **Error handling:** file and JSON operations return `Result`; `?` propagates to `main`, whose
+  `Box<dyn Error>` return type unifies I/O and serialization errors.
 
-In short: this project is the **"K" and the "V."** The **"distributed"** is the rest of the
-course, and every limit above is a signpost to the next project.
+## 6. Limitations and outlook
 
-### 6. In the CCGR framework (the book's language)
+Each limitation below is deliberate and names the module or technique that addresses it.
 
-From here on this repo also speaks the vocabulary of Cachin, Guerraoui & Rodrigues,
-*Introduction to Reliable and Secure Distributed Programming* (2nd ed., 2011) — **"CCGR"**, the
-reference text for the theory. Where `01` sits in its framework:
+- **Not crash-safe.** State is saved only on exit; a crash beforehand loses all writes since
+  startup. Crash safety requires logging each update to stable storage *before* acknowledging it
+  (write-ahead logging + `fsync`). *(→ stable storage discipline, Modules 05–06.)*
+- **O(n) persistence.** The entire store is rewritten on save. Append-only logs and LSM-trees
+  make the cost of persistence proportional to the update, at the price of compaction machinery.
+- **Single process.** No network interface. *(→ Module 02.)*
+- **No replication, no consistency model, no agreement.** One copy of the data; the questions of
+  consistency between copies and agreement on update order do not yet arise. *(→ Modules 03–05.)*
 
-- **The object is a *register*.** A KV store is a set of **read/write registers** — one per key —
-  the shared-storage abstraction CCGR develops in **Chapter 4**. A register supports two
-  operations, **read** (our `get`) and **write** (our `set`; `remove` writes a distinguished
-  "empty" value). This project implements the **single-process, failure-free case**: with no
-  concurrency and no faults, every read returns the last value written, so the register is
-  trivially **atomic / linearizable** (CCGR §4.1.3, *completeness and precedence*). The hard part
-  of Chapter 4 — keeping a register atomic once it is **replicated** across processes that can
-  fail — is exactly what project `03` begins, via **quorums**.
-- **Persistence is *stable storage*.** Our `save`/`load` to `store.db` is CCGR's **stable
-  storage** (§2.2.4): the `store`/`retrieve` operations a process uses to survive a
-  **crash-recovery** fault and defeat **amnesia** — the loss of volatile state on restart. The
-  book uses exactly this to lift crash-stop algorithms into the **fail-recovery** model (logged
-  links §2.4.5, logged registers §4.5). So `01`'s durability is an early, informal meeting with a
-  concept the later projects make precise.
-- **Failure model: none yet.** One process, no faults — below even the **crash-stop** model
-  (§2.2.2) the networked projects enter. In CCGR's classes of algorithms (§1.5), the distributed
-  story starts at `02`.
+## 7. Exercises
+
+1. **(Crash safety.)** Modify the implementation to append each successful `set`/`remove` to a
+   log file and `fsync` it before printing the confirmation, replaying the log on startup.
+   Measure the throughput cost relative to the current design. What is the crash-safety guarantee
+   now, stated precisely?
+2. **(Compaction.)** The log of Exercise 1 grows without bound. Implement periodic compaction
+   (write a snapshot, truncate the log) and state the invariant that must hold between snapshot
+   and log for recovery to be correct.
+3. **(Specification.)** Give a precise argument that every execution of this module's store
+   satisfies the register's sequential specification. Which of the assumptions (single process,
+   no crash) does your argument use, and where?
+4. **(Format migration.)** Design a versioned on-disk format for the store, and a migration path
+   that loads version *n* files into a version *n+1* store. What should the implementation do
+   when it encounters a file from version *n+2*?
+
+## References
+
+**Reference text**
+- C. Cachin, R. Guerraoui, L. Rodrigues, *Introduction to Reliable and Secure Distributed
+  Programming*, 2nd ed., Springer, 2011. For this module: stable storage and the crash-recovery
+  model (§2.2.4); registers (Ch. 4). ISBN 978-3-642-15259-7.
+
+**Single-node storage engines**
+- J. Sheehy, D. Smith, *Bitcask: A Log-Structured Hash Table for Fast Key/Value Data*, Basho
+  Technologies, 2010. <https://riak.com/assets/bitcask-intro.pdf>
+- P. O'Neil, E. Cheng, D. Gawlick, E. O'Neil, *The Log-Structured Merge-Tree (LSM-Tree)*,
+  Acta Informatica 33(4), 1996.
+
+**Distributed key-value stores**
+- G. DeCandia et al., *Dynamo: Amazon's Highly Available Key-value Store*, SOSP 2007.
+  <https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf>
+- F. Chang et al., *Bigtable: A Distributed Storage System for Structured Data*, OSDI 2006.
+- J. C. Corbett et al., *Spanner: Google's Globally-Distributed Database*, OSDI 2012.
+
+**Foundations**
+- S. Gilbert, N. Lynch, *Brewer's Conjecture and the Feasibility of Consistent, Available,
+  Partition-Tolerant Web Services*, ACM SIGACT News 33(2), 2002.
+- D. Karger et al., *Consistent Hashing and Random Trees*, STOC 1997.
+- I. Stoica et al., *Chord: A Scalable Peer-to-peer Lookup Service for Internet Applications*,
+  SIGCOMM 2001.
+- M. Fischer, N. Lynch, M. Paterson, *Impossibility of Distributed Consensus with One Faulty
+  Process*, JACM 32(2), 1985.
 
 ---
 
-## Run
+## Running the code
 
 ```bash
 cargo run     # start the REPL
-cargo test    # run the unit tests
+cargo test    # unit tests
 ```
 
 Example session:
@@ -151,79 +223,7 @@ remove name           -> Removed: Luca
 get name              -> Key not found
 exit
 ```
-State is written to `store.db` (JSON) on exit and reloaded on startup, so data survives a restart.
-
-## Design
-
-- **`Store`** — a thin wrapper over `HashMap<String, String>` with `set` / `get` / `remove`.
-- **REPL** — reads a line from stdin, splits it into words, and dispatches with a `match` on a
-  slice pattern (`["set", key, rest @ ..]`, `["get", key]`, …). Handles end-of-input and unknown commands.
-- **Persistence** — `serde` + `serde_json` serialize the store to JSON in `store.db`; `load`
-  reads it back on startup, treating a missing file on the first run as an empty store.
-
-## Notable implementation details
-
-- **Ownership by intent:** `get` borrows and lends back (`Option<&String>`); `remove` returns
-  an *owned* `String`, because the map gives that value up.
-- **Multi-word values:** a slice-rest pattern (`rest @ ..`) plus `join(" ")` lets values contain spaces.
-- **Errors:** file and JSON operations return `Result`; `?` propagates them to `main`, whose
-  `Box<dyn Error>` return type can hold either an I/O or a JSON error.
-
-## What I learned
-
-*Rust:* structs and methods, ownership and borrowing (owned vs. borrowed parameters and
-returns), `Option` / `Result` / `match`, the `?` operator, slice patterns, file I/O, `serde`
-derive macros, `Box<dyn Error>`, and unit tests.
-*Distributed systems:* **durability** and its weakest form; why order and crash-safety are not
-free; and that changing a serialization format is a real migration problem.
+State is written to `store.db` (JSON) on exit and reloaded on startup.
 
 ---
-
-## References
-
-The most important papers behind this topic. This project is a single-node toy; these are the
-systems and results it grows toward.
-
-**Course reference text (the theory spine for the whole repo)**
-- Christian Cachin, Rachid Guerraoui & Luís Rodrigues, *Introduction to Reliable and Secure
-  Distributed Programming*, 2nd ed., Springer, 2011. The text this repo's theory is aligned to.
-  For `01`: **stable storage** and the crash-recovery model (§2.2.4), and **registers** as the
-  shared-storage abstraction (Ch. 4). ISBN 978-3-642-15259-7.
-
-**Single-node storage engines**
-- Justin Sheehy & David Smith, *Bitcask: A Log-Structured Hash Table for Fast Key/Value Data*,
-  Basho Technologies, 2010. The append-log + in-memory-index design our persistence naturally
-  evolves toward; the storage model behind Riak (and PingCAP's TP201).
-  <https://riak.com/assets/bitcask-intro.pdf>
-- Patrick O'Neil, Edward Cheng, Dieter Gawlick, Elizabeth O'Neil, *The Log-Structured
-  Merge-Tree (LSM-Tree)*, Acta Informatica, 1996. The write-optimized engine behind LevelDB,
-  RocksDB, Cassandra, and TiKV.
-
-**Distributed key-value stores**
-- Giuseppe DeCandia et al., *Dynamo: Amazon's Highly Available Key-value Store*, SOSP 2007.
-  The archetypal highly-available (AP) KV store: consistent hashing, quorums, vector clocks,
-  hinted handoff. Blueprint for Cassandra, Riak, and DynamoDB.
-  <https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf>
-- Fay Chang et al., *Bigtable: A Distributed Storage System for Structured Data*, OSDI 2006.
-  A sorted, wide-column store; SSTables and tablets.
-- James C. Corbett et al., *Spanner: Google's Globally-Distributed Database*, OSDI 2012.
-  Externally-consistent, globally-distributed; the TrueTime clock.
-
-**Foundations (the tradeoffs any distributed KV store must confront)**
-- Seth Gilbert & Nancy Lynch, *Brewer's Conjecture and the Feasibility of Consistent,
-  Available, Partition-Tolerant Web Services*, ACM SIGACT News, 2002. The formal **CAP theorem**.
-- David Karger et al., *Consistent Hashing and Random Trees*, STOC 1997. Partitioning keys
-  across nodes with minimal reshuffling when membership changes.
-- Ion Stoica et al., *Chord: A Scalable Peer-to-peer Lookup Service for Internet Applications*,
-  SIGCOMM 2001. A key-value store realized as a distributed hash table (DHT).
-
-**Where this repo is heading (consistency via consensus)**
-- Diego Ongaro & John Ousterhout, *In Search of an Understandable Consensus Algorithm (Raft)*,
-  USENIX ATC 2014. The consensus algorithm behind etcd, a strongly-consistent KV store.
-- Leslie Lamport, *Paxos Made Simple*, 2001. The original consensus algorithm.
-- Michael Fischer, Nancy Lynch, Michael Paterson, *Impossibility of Distributed Consensus with
-  One Faulty Process (FLP)*, JACM 1985. Why consensus is fundamentally hard: no deterministic
-  protocol can guarantee agreement in an asynchronous system with even one crash.
-
----
-Part of [distributed-systems-in-rust](../).
+*[Course home](../) · Next: [Module 02 — The Networked Store](../02-networked-kv-store/)*

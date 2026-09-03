@@ -1,299 +1,311 @@
-# Consensus — a map
+# Consensus — Lecture Notes
 
-Everything in this repo has been climbing toward one problem: **getting a set of machines to agree**,
-despite failures and no shared clock. This document is the map — *when agreement is possible, why,
-and what it costs* — with pointers to where each idea is built in the projects. It is deliberately
-theory-first; the *code* for consensus lives in [`05-raft`](README.md).
+*Part of **Concurrent and Distributed Systems in Rust** ([course home](../)). Companion:
+[CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md). The implementation this
+document accompanies is [Module 05 (Raft)](README.md); it is also referenced from Modules 03,
+04, and 06.*
 
-Primary inspiration and further reading: **Decentralized Thoughts — "Consensus Cheat Sheet"**
-(<https://decentralizedthoughts.github.io/2021-10-29-consensus-cheat-sheet/>), and Cachin,
-Guerraoui & Rodrigues, *Introduction to Reliable and Secure Distributed Programming*, 2nd ed. (2011)
-— "CCGR".
+**Abstract.** These notes map the theory of distributed agreement: the consensus specification;
+the FLP impossibility and the two principled ways around it; timing models and their
+failure-detector counterparts; how the fault model sets quorum sizes (majority for crash
+faults, supermajority for Byzantine); the structure shared by the major protocol families
+(Paxos, Raft, PBFT, HotStuff); the relationship — and the sharp differences — between consensus
+and atomic commitment; and the CAP trade-off. Each concept is annotated with the module of this
+course in which it is built. Sources: CCGR (Cachin–Guerraoui–Rodrigues, 2nd ed., 2011) and the
+primary literature cited in §11; the Decentralized Thoughts "Consensus Cheat Sheet" is a useful
+informal companion.
 
 ---
 
 ## 1. The problem
 
-**Consensus:** each process proposes a value; all must **decide** on one common value. The
-specification (CCGR §5.1) is four properties:
+**Specification (consensus; CCGR Ch. 5).** Each process proposes a value; processes decide
+values subject to:
 
-- **Termination** *(liveness)* — every correct process eventually decides.
-- **Validity** — a decided value was proposed by some process.
-- **Integrity** — a process decides at most once.
-- **Agreement** *(safety)* — no two correct processes decide differently.
-  - **Uniform agreement** strengthens this: *no two processes decide differently, even one that later
-    crashes.* Raft gives uniform agreement — a committed entry never diverges, even on a node that
-    crashes right after committing.
+- **C1 (Termination — liveness).** Every correct process eventually decides some value.
+- **C2 (Validity — safety).** A decided value was proposed by some process.
+- **C3 (Integrity — safety).** No process decides more than once.
+- **C4 (Agreement — safety).** No two correct processes decide differently.
 
-Split it the CCGR way: **safety** (Agreement, Validity, Integrity — *nothing bad happens*) vs.
-**liveness** (Termination — *something good eventually happens*). Almost every impossibility and
-every "eventually" below is really a statement about **liveness**; safety is (almost) always
-preserved.
+**Uniform consensus** strengthens C4 to **all** processes: no two processes decide
+differently, even if one subsequently crashes. The distinction is not pedantic: an algorithm
+may let a process decide and crash, its decision contradicted afterwards — permitted by C4,
+forbidden by uniform agreement. Raft provides the uniform property (a committed entry binds
+every future of the system).
 
----
+The safety/liveness split organizes everything that follows: the impossibility results and
+every "eventually" concern **liveness**; correctly designed protocols never trade **safety**
+for them.
 
-## 2. Impossibility — FLP
+## 2. Impossibility: FLP
 
-> **FLP (Fischer–Lynch–Paterson, 1985):** in a fully **asynchronous** system, there is **no
-> deterministic** algorithm that solves consensus if even **one** process may crash.
+**Theorem (Fischer–Lynch–Paterson 1985).** In a fully asynchronous system, no deterministic
+algorithm solves consensus if even one process may crash.
 
-The intuition: with no timing bounds you can't distinguish a **crashed** process from a merely
-**slow** one, so any protocol can be forced (by an adversarial scheduler) into an infinite run that
-never decides. Crucially, FLP kills **liveness**, not safety — you can't be *stuck-free*, not *wrong*.
+The mechanism of the proof matters more than its statement: with no bounds on message delay or
+relative speed, a crashed process cannot be distinguished from a slow one, and an adversarial
+scheduler can forever maintain the ambiguity, postponing any decision indefinitely. FLP is a
+*liveness* impossibility — the adversary prevents termination, never forces a wrong decision.
 
-Circumventing it means weakening the async model — and there are really **two fundamental escapes**:
+Circumventing FLP means weakening the model, and there are two principled routes:
 
-**① Add a little *timing* — partial synchrony.** Delay bounds that hold *eventually* (after GST). You
-reach this power **two ways**, the same escape in different clothes:
-- *directly*, with **timeouts** written into the protocol — **Paxos, Raft, PBFT**; or
-- through the **failure-detector** interface (◇P / Ω — Chandra–Toueg 1996): prove the algorithm
-  correct against the detector's *timeless* axioms, and implement the detector *from* timeouts.
+**Route 1 — strengthen the timing assumptions (partial synchrony).** Assume delay bounds that
+hold *eventually* (§3). This power can be consumed in two equivalent forms:
+- *directly*, as timeouts written into the protocol (Paxos, Raft, PBFT); or
+- *modularly*, through the **failure-detector** interface (§4): prove the algorithm against an
+  oracle's axioms, and implement the oracle from timeouts separately.
 
-> A failure detector is **not** a way to beat asynchrony — ◇P/Ω are **unimplementable** in pure async
-> (that's FLP again). It is the clean *interface* to this escape: **partial synchrony is *sufficient* to
-> implement Ω** (the converse is false — Ω is implementable under strictly weaker timing, e.g. a single
-> eventually-timely link, so it's ⟸ not ⟺). Its payoff is **modularity** (CCGR §2.6.1) — a clock-free
-> safety proof, with all the timing quarantined inside Ω's implementation. *(The CHT result about Ω is a
-> different statement — see §4.)*
+A failure detector is not a way of defeating asynchrony — the useful detectors are
+unimplementable in a fully asynchronous system, by FLP itself. It is an *interface* to the
+timing escape. Partial synchrony is **sufficient** to implement the eventual leader detector Ω;
+the converse fails — Ω is implementable under strictly weaker assumptions (e.g., a single
+eventually timely source; Aguilera et al.), so the relation is one-directional. The payoff of
+the interface is modularity (CCGR §2.6.1): a clock-free safety proof with all timing
+quarantined inside the detector's implementation.
 
-**② Add a little *luck* — randomization.** Coin flips break the adversary's grip; this is the **only**
-escape that keeps *full* asynchrony — **Ben-Or 1983**; randomized BFT (HoneyBadgerBFT).
+**Route 2 — randomization.** Randomized algorithms (Ben-Or 1983; modern asynchronous BFT such
+as HoneyBadgerBFT) terminate with probability 1 while keeping the fully asynchronous model.
+This is the only route that retains full asynchrony; FLP forbids only *deterministic*
+solutions.
 
-Refuse both, and FLP stands.
-
-**Fault-model note.** Both escapes are **fault-agnostic** at the *model* level (DLS gives Byzantine
-partial synchrony; Ben-Or has a Byzantine variant) — **but the failure-detector *packaging* is
-crash-only.** A Byzantine process is *up and lying*, not stopped, so it **evades detection** (a
-malicious node behaves correctly toward the detector and strikes elsewhere — CCGR §2.6.1 declines FDs
-for Byzantine). There, *"is it honest?"* is undetectable; you replace detection with **bigger quorums
-(`3f+1`, honest intersection) + signatures**, and the leader-election role survives only as a
-*specialized* **view-change** (CCGR §2.6.6) — driven by timeouts + algorithm-specific monitoring, not
-a generic crash detector.
-
----
+**Fault-model note.** Both routes exist for crash *and* Byzantine faults (DLS treats Byzantine
+partial synchrony; Ben-Or has Byzantine variants). The failure-detector *packaging*, however,
+is crash-only: a Byzantine process is operational and deviating, not silent, so it evades any
+crash detector — it can behave impeccably toward the detector while equivocating elsewhere
+(CCGR §2.6 accordingly does not offer Byzantine failure detectors). In the Byzantine world the
+role of detection is replaced by larger quorums with honest intersection (§6) plus
+authentication, and leader replacement survives only as the protocol-specific **view-change**
+(§7).
 
 ## 3. Timing models
 
-The single most important axis. What can you assume about message delay and relative process speed?
+The principal axis of the theory: what may be assumed about message delay and process speed?
 
-| Model | Assumption | Consensus? |
+| Model | Assumption | Deterministic consensus |
 |---|---|---|
-| **Synchronous** | known upper bounds on delay + step time | solvable, even simply |
-| **Partially synchronous** | bounds exist but are **unknown**, or hold only **after an unknown GST** (Global Stabilization Time) | solvable with a majority (Paxos/Raft) |
-| **Asynchronous** | no bounds at all | **impossible deterministically** (FLP) |
+| **Synchronous** | known upper bounds on delay and step time | solvable; crashes are detectable by timeout |
+| **Partially synchronous** | bounds exist but are unknown, and/or hold only after an unknown **GST** (global stabilization time) | solvable with a correct majority (Paxos, Raft) |
+| **Asynchronous** | no bounds | impossible (FLP) |
 
-**Partial synchrony** (Dwork–Lynch–Stockmeyer, 1988) is the sweet spot real systems assume: the
-network is *usually* timely, occasionally not. Protocols keep **safety always**, and regain
-**liveness after GST** (once messages start arriving within the timeout). Raft's randomized election
-timeout is exactly this: before GST, timeouts may misfire (split votes, extra elections — never a
-lost commit); after GST, one stable leader emerges. *(Built in `04`'s failure detector; `05`'s
-election.)*
+Partial synchrony (Dwork–Lynch–Stockmeyer 1988) is the model practical systems inhabit: the
+network is usually timely and occasionally arbitrary. Well-designed protocols are **safe
+unconditionally** and **live after GST** — Raft's randomized election timeout is the canonical
+example: before stabilization, elections may split and repeat (a liveness cost only); after it,
+a single leader emerges and commits proceed. Modules 04 and 05 implement exactly this regime.
 
----
+## 4. The failure-detector lens
 
-## 4. The failure-detector lens (equivalent to timing)
+A **failure detector** packages timing assumptions as a per-process oracle (CCGR §2.6);
+Module 04 states the specifications formally. The correspondence:
 
-You can package "how much synchrony you have" as a **failure detector** — an oracle that reports
-suspected crashes, letting an algorithm avoid explicit clocks (CCGR §2.6). This is a *second lens on
-the same resource*:
-
-| Timing model | Detector you can build | Symbol |
-|---|---|---|
-| Synchronous | **perfect** — never wrong | **P** |
-| Partially synchronous | **eventually perfect** / eventual leader | **◇P / Ω** |
-| Asynchronous | none strong enough | — |
-
-- **P** never suspects a correct process (strong accuracy) — only synchrony can guarantee that.
-- **◇P / Ω** are *eventually* accurate: wrong for a while, correct after GST. **Ω** ("eventual
-  leader") outputs one process that *eventually* all correct nodes agree is up.
-- **The bridge theorem (Chandra–Hadzilacos–Toueg, 1996): Ω is the *weakest* failure detector that
-  solves consensus** — *given a majority of correct processes* (f < n/2). (Without the majority
-  assumption the weakest detector is the pair **(Σ, Ω)**, where Σ is the quorum detector.) So, with a
-  correct majority, *consensus is solvable ⟺ you can implement Ω*; and since **partial synchrony is
-  *sufficient* (not necessary) to implement Ω**, partial synchrony ⟹ Ω ⟹ consensus. The timing lens
-  and the detector lens draw essentially the **same** boundary — modulo that Ω needs slightly less
-  than full partial synchrony.
-
-> Slogan: **synchrony → P; partial synchrony → Ω; asynchrony → nothing (FLP).** Detectors are
-> *synchrony, packaged as an oracle.* (Expanded in [`04`'s README](../04-leader-election/README.md).)
-
----
-
-## 5. Fault models — this sets the *quorum size*
-
-Timing decides *solvability*; the **fault model** decides *how many nodes you need* (CCGR §2.2):
-
-- **Crash-stop** — a process halts and never returns. (Paxos, Raft.)
-- **Crash-recovery** — halts and later recovers, losing volatile state (needs stable storage).
-- **Byzantine / arbitrary** — a process may do *anything*: lie, equivocate, collude. (PBFT, HotStuff,
-  blockchains.)
-
-The jump from crash to Byzantine is the jump from **"trust the messages"** to **"verify everything"**
-— and it changes the arithmetic.
-
----
-
-## 6. Quorums — the arithmetic of agreement
-
-A **quorum** is a set large enough that any two quorums **intersect**. That overlap is what carries a
-decision forward: the shared node "remembers." (CCGR §2.7.3.)
-
-- **Crash faults — majority.** With `N = 2f+1` nodes tolerating `f` crashes, a quorum is `f+1` (a
-  **majority**). Any two majorities share **≥ 1** node, which remembers the last decision. *(This is
-  every quorum in `03`, `04`, and `05`.)*
-- **Byzantine faults — supermajority.** Now the shared node must be **honest** (a Byzantine one could
-  lie to each side). Two constraints:
-  - **availability:** you can only wait for `N − f` replies (`f` may be silent) → `Q ≤ N − f`;
-  - **honest intersection:** two quorums share `≥ 2Q − N` nodes, and that must exceed `f` → `2Q − N > f`.
-  - Together: `N > 3f`, so **`N = 3f+1`**, quorum **`Q = 2f+1`** (a **>⅔ supermajority**). This is
-    where Ethereum's Casper FFG and every PoS BFT chain live.
-
-**The full picture (timing × fault):**
-
-| | **Synchronous** | **Partially synchronous** |
-|---|---|---|
-| **Crash** | `f+1` (timeouts detect crashes; majority not even needed for safety) | `2f+1` — **majority** (Paxos, Raft) |
-| **Byzantine** | `f+1` *with signatures* (Dolev–Strong); `3f+1` without | `3f+1` — **>⅔**, even with signatures (DLS lower bound) |
-
-Two reads of this table: **majority is the price of not being able to tell *dead* from *slow*** (the
-partial-sync crash cell); **>⅔ is the price of not being able to tell *honest* from *lying*** (the
-Byzantine cell).
-
----
-
-## 7. Protocol families & round structure
-
-All leader-based consensus shares a skeleton: **(1) establish leadership** for an epoch, **(2)
-replicate/commit** a value. What differs is the number of rounds and the quorum.
-
-| | **(Multi-)Paxos** | **Raft** | **PBFT** | **HotStuff** |
-|---|---|---|---|---|
-| Fault model | crash | crash | Byzantine | Byzantine |
-| Leadership phase | Prepare (per ballot) | election (per term) | view / view-change | leader per view |
-| Replication phase | Accept | AppendEntries | pre-prepare → prepare → commit | pipelined 3-chain |
-| Round-trips **/ command** (steady state) | **1** | **1** | **2** all-to-all | **1** (pipelined), linear msgs |
-| Quorum | majority | majority | `2f+1` of `3f+1` | `2f+1` of `3f+1` |
-
-- **Raft ≈ Multi-Paxos** with a strong leader: elect once per term, then each command commits in **one
-  majority round-trip** (`AppendEntries` → majority ack). *(That's exactly `05`.)*
-- **PBFT** (Castro–Liskov, 1999) needs a **third phase**: after *prepare* (agree on ordering in this
-  view), the *commit* phase makes the decision **survive a view-change** despite a lying leader —
-  lifting "I know it's agreed" to "I know enough others know." Plus `>⅔` quorums and signatures.
-- **HotStuff** (Yin et al., 2019) makes BFT **linear** (leader-to-all, threshold signatures) and
-  **pipelined** — the basis of modern PoS chains (Tendermint, DiemBFT, Ethereum-adjacent designs).
-
-> The extra Byzantine round and the bigger quorum are the *same* fact from two angles: you can't
-> trust a single message, so you need one more round of cross-checking and one more slice of the
-> cluster in every quorum.
-
-### Leader election *detects*; quorums *decide* (and the view-change welds them)
-
-Leader election / leader-detection only ever buys **liveness** — it points at a leader so the group
-can *make progress*, and it may be **wrong** (suspect a good leader, tolerate a slow bad one) without
-ever breaking correctness. **Safety is a separate guarantee**, carried by the **quorums** (and, in
-BFT, **signatures**) — never by the detector.
-
-- **Crash (Raft):** cleanly separable. Ω picks a leader (liveness); the majority quorum + the
-  up-to-date-log restriction keep it safe (safety). A wrong Ω only costs an extra election.
-- **Byzantine (PBFT / HotStuff):** the two are **welded together in the view-change**, which must at
-  once (a) rotate away from a suspected/faulty leader *and* (b) **preserve every committed value**
-  across the change — and (b) is the hard part. The challenges:
-  - **Trust no one.** The old leader may have equivocated; any replica may lie. The new leader must
-    justify its starting point from a **quorum of *signed* certificates**, not any single report.
-  - **Preserve commits across the handoff.** If *any* honest node committed `v` in the old view, the
-    new leader is *forced* to re-propose something consistent with `v`. The commit phase +
-    prepare/commit certificates exist precisely to make this **provable** despite a lying predecessor.
-  - **Cost & correctness.** Classic PBFT view-change is `O(n²)`–`O(n³)` and notoriously subtle;
-    **HotStuff** re-engineered it to be **linear** (threshold signatures + a uniform 3-chain rule) —
-    proof of how hard "just change the leader" really is.
-
-> Slogan: **detectors/leaders provide *liveness*; quorums provide *safety*.** In crash consensus the
-> two live in separate boxes; in BFT the **view-change** must deliver both at once — which is why it
-> is the single hardest, most bug-prone piece of every Byzantine protocol.
-
----
-
-## 8. Atomic commit is *not* consensus (2PC)
-
-A frequent trap: **two-phase commit (2PC)** looks like consensus but solves a *different* problem —
-**atomic commit** (a transaction is all-or-nothing across participants), and it does so **unsafely
-under failure**:
-
-- **2PC** (Gray, 1978): coordinator asks all participants to *prepare* (vote), then *commit* if all
-  voted yes. **Blocking:** if the coordinator crashes at the wrong moment, participants are **stuck**
-  holding locks — it does **not** tolerate coordinator failure. Atomic commit even requires *every*
-  participant to agree (unanimity), unlike consensus's *majority*.
-- **3PC** (Skeen, 1981): adds a phase to be non-blocking **under synchrony** — but breaks under
-  network partitions.
-- **Paxos Commit** (Gray & Lamport, 2006): run the commit *decision itself through consensus* → a
-  **fault-tolerant** atomic commit. The clean fusion of the two ideas.
-
-> **Consensus** (Paxos/Raft/PBFT) is **non-blocking and fault-tolerant**; **2PC** is **blocking and
-> not**. Don't conflate 2PC's two phases with consensus's two phases — they solve different problems
-> with opposite failure behavior. *(2PC is a Stage-4 project in the roadmap; BFT is Stage-5.)*
-
----
-
-## 9. CAP — the design fork behind all of it
-
-**CAP (Brewer 2000; Gilbert & Lynch 2002):** under a network **P**artition you must choose
-**C**onsistency *or* **A**vailability. Consensus systems (etcd, Spanner, and our `03`/`05`) choose
-**CP** — they **refuse** to make progress without a quorum rather than risk disagreement. `03` made
-this choice visible (it returns `ERR no quorum`); Raft inherits it (no leader without a majority).
-
----
-
-## 10. Where the repo sits on this map
-
-| Project | On this map |
+| Timing model | Implementable detector |
 |---|---|
-| `01`, `02` | pre-consensus: a register, then over the network |
-| `03` | the **(1,N) majority register** — quorum reads/writes; **CP**; crash faults |
-| `04` | **failure detection ◇P + eventual leader Ω** — partial synchrony, packaged |
-| `05` | **crash consensus (Raft)** — Ω-driven, majority quorums, uniform agreement |
-| **next** | **2PC / atomic commit** (Stage 4); **Byzantine consensus** (Stage 5) — the `3f+1`, `>⅔` world of your Ethereum work |
+| synchronous | **P** (perfect: strong completeness + strong accuracy) |
+| partially synchronous | **◇P** (eventually perfect), **Ω** (eventual leader) |
+| asynchronous | none of the above |
 
----
+**Theorem (Chandra–Hadzilacos–Toueg 1996).** Ω is the *weakest* failure detector that solves
+consensus, given a majority of correct processes (`f < n/2`). Without the majority assumption,
+the weakest is the pair (Σ, Ω), where Σ — the quorum detector — supplies the intersecting-set
+structure that a majority otherwise provides.
 
-## References (verify every venue/year — it is 2026)
+Consequently, with a correct majority: consensus is solvable iff Ω is implementable; and since
+partial synchrony suffices for Ω (but is not necessary — §2), the timing lens and the detector
+lens draw essentially the same boundary, with Ω marking it slightly more finely.
 
-**The problem & impossibility**
-- M. Fischer, N. Lynch, M. Paterson, *Impossibility of Distributed Consensus with One Faulty Process*,
-  JACM 1985. (FLP.)
-- C. Dwork, N. Lynch, L. Stockmeyer, *Consensus in the Presence of Partial Synchrony*, JACM 1988.
-  (Partial synchrony / GST.)
+Summary: *synchrony yields P; partial synchrony yields ◇P and Ω; asynchrony yields nothing
+strong enough (FLP).* Module 04 constructs ◇P and Ω from heartbeats; Module 05 consumes Ω.
+
+## 5. Fault models
+
+Timing determines *solvability*; the fault model determines *cost* — chiefly, quorum size
+(§6). CCGR §2.2:
+
+- **Crash-stop.** A faulty process halts and takes no further steps.
+- **Crash-recovery.** A faulty process may halt and later rejoin, having lost volatile state;
+  algorithms compensate with stable storage (Modules 05–06: *persist before you externalize*).
+- **Byzantine (arbitrary).** A faulty process may deviate arbitrarily: lie, equivocate, send
+  conflicting messages to different peers, collude. Authentication (signatures) limits but does
+  not eliminate the deviations.
+
+The crash-to-Byzantine transition replaces *trusting silence* ("no message means slow or
+dead") with *distrusting content* ("any message may be false") — and changes the arithmetic.
+
+## 6. Quorums: the arithmetic of agreement
+
+**Definition.** A **quorum system** over `N` processes is a collection of subsets (quorums)
+such that any two quorums intersect. Protocol steps (votes, acknowledgments, promises) are
+validated by quorums; intersection is what carries information from one protocol step — or one
+leadership epoch — to the next: the common member "remembers." (CCGR §2.7.3; Module 03 proves
+the intersection lemma.)
+
+**Crash faults: majority quorums.** With `N = 2f + 1` tolerating `f` crashes, quorums of size
+`f + 1 = ⌈(N+1)/2⌉` intersect in at least one process, and a quorum of correct processes always
+exists (availability). This is every quorum in Modules 03–05.
+
+**Byzantine faults: supermajority quorums.** Intersection must now contain at least one
+*honest* process — a Byzantine one in the overlap may tell each side a different story. Two
+constraints: **availability** — a process can wait for at most `N − f` replies (`f` faulty
+processes may stay silent), so quorums cannot exceed `N − f`; **honest intersection** — two
+quorums of size `Q` share `≥ 2Q − N` members, of which at most `f` are faulty, so honest
+intersection needs `2Q − N > f`. With `Q = N − f`: `N > 3f`. Hence the classical sizing
+**`N = 3f + 1`, `Q = 2f + 1`** — quorums are strict two-thirds supermajorities. This is the
+arithmetic underlying PBFT, HotStuff, Tendermint, and proof-of-stake finality gadgets
+(e.g., Ethereum's Casper FFG).
+
+**Timing × fault, in one table** (entries: minimum replication to tolerate `f`):
+
+| | synchronous | partially synchronous |
+|---|---|---|
+| **crash** | `f + 1` (timeouts detect crashes) | `2f + 1` — majority (Paxos, Raft) |
+| **Byzantine** | `f + 1` with signatures (Dolev–Strong); `3f + 1` without (Pease–Shostak–Lamport) | `3f + 1`, even with signatures (DLS lower bound) |
+
+Two readings of the table: **majority is the price of not distinguishing dead from slow** (the
+partially synchronous crash cell); **two-thirds is the price of not distinguishing honest from
+lying** (the Byzantine cells under partial synchrony).
+
+## 7. Protocol families and round structure
+
+Leader-based consensus protocols share a two-part skeleton: (1) establish a leader for an
+epoch; (2) have the leader drive values through quorums. The families differ in rounds and
+quorum type:
+
+| | (Multi-)Paxos | Raft | PBFT | HotStuff |
+|---|---|---|---|---|
+| fault model | crash | crash | Byzantine | Byzantine |
+| leadership | ballot / Prepare | term / election | view / view-change | view per round |
+| replication | Accept | AppendEntries | pre-prepare → prepare → commit | pipelined three-phase chain |
+| steady-state cost per command | 1 round-trip | 1 round-trip | 2 all-to-all rounds | linear, pipelined |
+| quorum | majority | majority | `2f+1` of `3f+1` | `2f+1` of `3f+1` |
+
+- **Raft ≈ Multi-Paxos** with a strong leader: elect once per term; thereafter one majority
+  round-trip per command (Module 05).
+- **PBFT** (Castro–Liskov 1999) requires a second voting phase: after *prepare* establishes
+  agreement on ordering within a view, *commit* ensures the decision survives a view-change —
+  lifting "a quorum knows" to "a quorum knows that a quorum knows," which is what a new leader
+  can verifiably reconstruct despite lying predecessors.
+- **HotStuff** (Yin et al. 2019) linearizes communication (leader-mediated, threshold
+  signatures) and pipelines the phases; it is the design basis of several production BFT
+  systems (DiemBFT/Jolteon lineage; Tendermint is the earlier chained-BFT relative).
+
+**Leader election provides liveness; quorums provide safety.** A leader oracle only points at a
+process so the group can make progress; it may be wrong without endangering correctness. In
+crash consensus the two concerns separate cleanly: a wrong Ω costs an extra election, while
+majority quorums and the election restriction carry safety. In Byzantine protocols the
+concerns meet in the **view-change**, which must simultaneously depose a suspected leader
+*and* prove, from `2f+1` signed certificates, a starting state consistent with every possibly
+committed value. The view-change is where the second voting phase pays off, where classic PBFT
+incurred its `O(n³)` worst case, and where HotStuff's chief innovation lies (a linear,
+uniform rule). It is, by common experience, the most defect-prone component of deployed BFT
+systems — the practical reason Module 08 treats it as a first-class topic rather than a
+footnote.
+
+## 8. Consensus is not atomic commitment
+
+**Atomic commitment** (Module 06; CCGR §6.1) resembles consensus — all processes must reach one
+decision — but differs in both defining dimensions:
+
+- **Decision function.** Consensus may decide any proposed value (C2). Atomic commitment's
+  outcome is a *function of all votes*: COMMIT only if every participant voted YES; one NO (or
+  one crash) forces ABORT. Unanimity, not choice.
+- **Fault tolerance.** Consensus proceeds with any majority. Two-phase commit **blocks**: a
+  coordinator crash between voting and decision strands participants in doubt, holding locks,
+  unable to terminate (demonstrated end-to-end in Module 06).
+
+The failure-detector hierarchy makes the difference precise: consensus requires Ω (with a
+majority), while non-blocking atomic commitment in general requires the **perfect** detector P
+— deciding COMMIT requires *certainty* that no participant has crashed, which no
+eventually-accurate detector supplies. In this exact sense NBAC is the harder problem, and the
+practical repair is to *reuse* consensus rather than avoid it: **Paxos Commit**
+(Gray–Lamport 2006) runs the commit decision through a consensus instance, eliminating the
+single point of blocking; 2PC is its one-acceptor degenerate case. Layered architectures
+(Spanner, CockroachDB) compose the two: consensus inside each replicated shard, atomic
+commitment across shards.
+
+Terminological caution: 2P**C**'s two phases (vote, decide) are unrelated to 2P**L**'s two
+phases (lock growth, lock shrinkage) — see
+[CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md) §6 — and neither
+corresponds to the phases of Paxos.
+
+## 9. CAP
+
+**Theorem (Gilbert–Lynch 2002, formalizing Brewer).** A read/write register cannot
+simultaneously guarantee consistency (linearizability), availability (every request to a
+non-failed node receives a response), and tolerance of network partitions.
+
+During a partition, a system chooses: refuse service on the minority side (consistency over
+availability — the choice of every quorum protocol in this course: Module 03 returns
+`ERR no quorum`; Raft simply has no leader on a minority partition) or serve stale data
+(availability over consistency — the Dynamo family, with reconciliation machinery downstream).
+CAP is thus not an exotic limit but the operational face of quorum intersection: the same
+arithmetic that provides safety necessarily withholds service from minorities.
+
+## 10. The course on this map
+
+| Module | Position |
+|---|---|
+| [01](../01-kv-store/), [02](../02-networked-kv-store/) | pre-agreement: the register; processes, links, local concurrency |
+| [03](../03-replicated-kv-store/) | the (1, N) majority-quorum register — what is achievable *without* consensus, and what is not |
+| [04](../04-leader-election/) | ◇P and Ω from heartbeats — partial synchrony, packaged |
+| [05](README.md) | crash consensus (Raft): uniform agreement, majority quorums, crash-recovery |
+| [06](../06-two-phase-commit/) | atomic commitment (2PC): unanimity, blocking, the P-vs-Ω separation |
+| 07 (planned) | **Byzantine reliable broadcast** (Bracha): `3f+1`, echo/ready quorum amplification — the first Byzantine primitive |
+| 08 (planned) | **Byzantine consensus** (PBFT-style): two-phase voting, certificates, view-change |
+
+## 11. References
+
+**Impossibility and models**
+- M. Fischer, N. Lynch, M. Paterson, *Impossibility of Distributed Consensus with One Faulty
+  Process*, JACM 32(2), 1985.
+- C. Dwork, N. Lynch, L. Stockmeyer, *Consensus in the Presence of Partial Synchrony*,
+  JACM 35(2), 1988.
 
 **Failure detectors**
-- T. Chandra, S. Toueg, *Unreliable Failure Detectors for Reliable Distributed Systems*, JACM 1996.
-- T. Chandra, V. Hadzilacos, S. Toueg, *The Weakest Failure Detector for Solving Consensus*, JACM 1996.
-  (Ω is weakest.)
+- T. D. Chandra, S. Toueg, *Unreliable Failure Detectors for Reliable Distributed Systems*,
+  JACM 43(2), 1996.
+- T. D. Chandra, V. Hadzilacos, S. Toueg, *The Weakest Failure Detector for Solving
+  Consensus*, JACM 43(4), 1996.
+- C. Delporte-Gallet, H. Fauconnier, R. Guerraoui, *Tight Failure Detection Bounds on Atomic
+  Object Implementations*, JACM 57(4), 2010. (Σ.)
+- M. K. Aguilera, C. Delporte-Gallet, H. Fauconnier, S. Toueg, *On Implementing Omega with
+  Weak Reliability and Synchrony Assumptions*, PODC 2003.
 
 **Crash consensus**
-- L. Lamport, *The Part-Time Parliament*, ACM TOCS 1998; *Paxos Made Simple*, 2001.
-- D. Ongaro, J. Ousterhout, *In Search of an Understandable Consensus Algorithm (Raft)*, USENIX ATC 2014.
-- M. Ben-Or, *Another Advantage of Free Choice*, PODC 1983. (Randomized consensus.)
+- L. Lamport, *The Part-Time Parliament*, ACM TOCS 16(2), 1998; *Paxos Made Simple*, ACM
+  SIGACT News 32(4), 2001.
+- D. Ongaro, J. Ousterhout, *In Search of an Understandable Consensus Algorithm (Raft)*,
+  USENIX ATC 2014.
+- M. Ben-Or, *Another Advantage of Free Choice: Completely Asynchronous Agreement Protocols*,
+  PODC 1983.
 
-**Byzantine consensus**
-- L. Lamport, R. Shostak, M. Pease, *The Byzantine Generals Problem*, ACM TOPLAS 1982; and
-  M. Pease, R. Shostak, L. Lamport, *Reaching Agreement in the Presence of Faults*, JACM 1980. (`3f+1`.)
-- D. Dolev, H. Strong, *Authenticated Algorithms for Byzantine Agreement*, SIAM J. Computing 1983.
-- M. Castro, B. Liskov, *Practical Byzantine Fault Tolerance*, OSDI 1999. (PBFT.)
-- M. Yin, D. Malkhi, M. Reiter, G. Gueta, I. Abraham, *HotStuff: BFT Consensus with Linearity and
-  Responsiveness*, PODC 2019.
-- E. Buchman, J. Kwon, Z. Milosevic, *The Latest Gossip on BFT Consensus*, 2018. (Tendermint.)
+**Byzantine agreement and broadcast**
+- M. Pease, R. Shostak, L. Lamport, *Reaching Agreement in the Presence of Faults*, JACM
+  27(2), 1980; L. Lamport, R. Shostak, M. Pease, *The Byzantine Generals Problem*, ACM TOPLAS
+  4(3), 1982.
+- D. Dolev, H. R. Strong, *Authenticated Algorithms for Byzantine Agreement*, SIAM J.
+  Computing 12(4), 1983.
+- G. Bracha, *Asynchronous Byzantine Agreement Protocols*, Information and Computation 75(2),
+  1987. (Reliable broadcast — Module 07.)
+- M. Castro, B. Liskov, *Practical Byzantine Fault Tolerance*, OSDI 1999.
+- M. Yin, D. Malkhi, M. K. Reiter, G. Gueta, I. Abraham, *HotStuff: BFT Consensus with
+  Linearity and Responsiveness*, PODC 2019.
+- E. Buchman, J. Kwon, Z. Milosevic, *The Latest Gossip on BFT Consensus*, arXiv:1807.04938,
+  2018. (Tendermint.)
+- A. Miller, Y. Xia, K. Croman, E. Shi, D. Song, *The Honey Badger of BFT Protocols*, CCS
+  2016.
 
-**Atomic commit & CAP**
-- J. Gray, *Notes on Data Base Operating Systems*, 1978. (2PC.)  ·  D. Skeen, *Nonblocking Commit
-  Protocols*, SIGMOD 1981. (3PC.)
-- J. Gray, L. Lamport, *Consensus on Transaction Commit*, ACM TODS 2006. (Paxos Commit.)
+**Atomic commitment and CAP**
+- J. Gray, *Notes on Data Base Operating Systems*, Springer LNCS 60, 1978.
+- D. Skeen, *Nonblocking Commit Protocols*, SIGMOD 1981.
+- J. Gray, L. Lamport, *Consensus on Transaction Commit*, ACM TODS 31(1), 2006.
 - S. Gilbert, N. Lynch, *Brewer's Conjecture and the Feasibility of Consistent, Available,
-  Partition-Tolerant Web Services*, ACM SIGACT News 2002. (CAP.)
+  Partition-Tolerant Web Services*, ACM SIGACT News 33(2), 2002.
 
-**Textbook & survey**
+**Text and surveys**
 - C. Cachin, R. Guerraoui, L. Rodrigues, *Introduction to Reliable and Secure Distributed
-  Programming*, 2nd ed., Springer 2011. (CCGR.)
+  Programming*, 2nd ed., Springer, 2011.
 - Decentralized Thoughts, *Consensus Cheat Sheet*, 2021.
   <https://decentralizedthoughts.github.io/2021-10-29-consensus-cheat-sheet/>
 
 ---
-Part of [distributed-systems-in-rust](../).  ·  Implementation: [`05-raft`](README.md).
+*[Course home](../) · Implementation: [Module 05 — Raft](README.md)*

@@ -1,300 +1,372 @@
-# 06 — Two-Phase Commit
+# Module 06 — Atomic Commitment: Two-Phase Commit and Its Blocking Behavior
 
-A working implementation of **Two-Phase Commit (2PC)** — the classic **atomic commit** protocol — and
-a demonstration of its famous **blocking flaw**. Where `05` made a set of *replicas* agree on one log
-(consensus), this project makes a set of *different* nodes — **partitions**, each holding its own data
-— commit a single transaction **all-or-nothing**. A coordinator asks every participant "can you do
-your part?"; only if **all** say YES does the transaction commit; a single NO (or crash) aborts
-everyone. The domain is a **bank transfer**: move $30 from account A to account B, atomically, when A
-and B live on different machines.
+*Part of **Concurrent and Distributed Systems in Rust** ([course home](../)). Reference text:
+**CCGR** (Cachin, Guerraoui & Rodrigues, 2nd ed., 2011). Prerequisites:
+[Module 05](../05-raft/) (for the contrast with consensus). Theory companions:
+[CONSENSUS.md](../05-raft/CONSENSUS.md),
+[CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md).*
 
-The point of building it, right after Raft, is to make one sentence concrete and unforgettable:
-
-> **Consensus ≠ atomic commit.** Raft (majority) keeps making progress when a minority crashes. 2PC
-> (unanimity, one coordinator) **grinds to a permanent halt** when the coordinator dies at the wrong
-> moment. You can watch it wedge on your own terminal (`demos/blocking.py`).
-
-> **Companion theory maps:** [`CONSENSUS.md`](../05-raft/CONSENSUS.md) (why 2PC ≠ consensus, in the
-> impossibility landscape) and [`CONSISTENCY_AND_CONCURRENCY.md`](../CONSISTENCY_AND_CONCURRENCY.md)
-> (linearizability vs serializability, 2PL, the mechanisms). This README is about *2PC, the protocol
-> we built*.
+**Abstract.** This module implements **two-phase commit (2PC)**, the classical protocol for
+**atomic commitment** of a transaction whose effects span several nodes, and demonstrates —
+constructively, on a running system — its defining weakness: a coordinator crash between the
+voting and decision phases leaves participants *in doubt*, holding locks, unable to terminate.
+Where Module 05's consensus makes progress with any majority, atomic commitment requires
+**unanimity** through a single coordinator, and this difference in decision rule produces an
+inversion of fault behavior. The module introduces transactions and their properties (with the
+formal treatment in the theory companion), specifies **non-blocking atomic commitment (NBAC)**
+following CCGR §6.1, presents 2PC and its correctness for the properties it does satisfy,
+exhibits the blocking execution, connects the participant's in-doubt state to **strict
+two-phase locking**, and surveys the repairs (three-phase commit; **Paxos Commit**, atomic
+commitment over consensus). The domain is a bank transfer across accounts held on different
+nodes — a transaction over **partitioned** data, in contrast to the **replicated** data of
+Modules 03 and 05.
 
 ---
 
-## Theory — atomic commit
+## Learning objectives
 
-### 1. The problem: atomic commit ≠ replication
+After completing this module, the reader should be able to:
 
-A transaction can span **multiple** data items on **multiple** machines: a transfer *debits* A **and**
-*credits* B. These are **partitions** (shards) — different data, one copy each — not **replicas** (the
-same data copied for fault tolerance, as in `03`/`05`). The requirement is **atomicity**: either
-*both* the debit and the credit happen, or *neither* does. No node can see the others' data, so a
-**coordinator** orchestrates a single all-or-nothing decision across them.
+1. define a distributed transaction over partitioned data and state the ACID properties,
+   distinguishing atomicity (all-or-nothing under failure) from isolation (correctness under
+   concurrency);
+2. specify NBAC and identify which property 2PC fails;
+3. describe both phases of 2PC, including the participant's obligations on voting YES
+   (durability of the vote; holding locks);
+4. exhibit the blocking execution and explain *why* an in-doubt participant can neither decide
+   unilaterally nor learn the outcome from its peers;
+5. explain why persistence of the in-doubt state is required for safety yet makes blocking
+   permanent rather than curing it;
+6. contrast atomic commitment with consensus along both axes (decision function; fault
+   tolerance) and state the failure-detector separation (P vs. ◇P/Ω);
+7. relate the participant's `prepared` state to strict two-phase locking;
+8. describe Paxos Commit and the layered architecture (2PC across shards, each shard a
+   consensus group) used by systems such as Spanner.
 
-| | Replication (`03`, `05`) | Partitioning + atomic commit (`06`) |
+---
+
+## 1. The problem: transactions over partitioned data
+
+### 1.1 Partitioning versus replication
+
+The preceding modules kept **the same** data on every node (replication: fault tolerance
+through redundancy). This module's nodes hold **different** data — disjoint **partitions**
+(shards) of the whole: account *A* on one node, account *B* on another. The two regimes pose
+different problems and admit different decision rules:
+
+| | Replication (03, 05) | Partitioning + atomic commitment (06) |
 |---|---|---|
-| each node holds | the **same** data (a copy) | **different** data (a shard) |
-| goal | fault tolerance (survive a node dying) | atomicity of a multi-shard operation |
-| decision rule | **majority** (quorum) | **unanimity** (every participant) |
-| one node dying | tolerated (others have the data) | **fatal to atomicity** (its shard is unique *and* its vote is required) |
+| each node holds | a copy of the same data | a distinct shard |
+| goal | survive node loss | all-or-nothing effects across shards |
+| a node is | interchangeable | irreplaceable (its shard exists nowhere else) |
+| decision rule | **majority** | **unanimity** |
+| one node's crash | tolerated | forces abort — or, for the coordinator, blocks |
 
-### 2. Non-Blocking Atomic Commit — the specification (CCGR §6.1)
+### 1.2 Transactions
 
-The abstraction 2PC *tries* to implement. Each participant proposes a **vote** (YES/commit or
-NO/abort); all must **decide** one common outcome (COMMIT or ABORT):
+A **transaction** is a finite sequence of operations on named data items, terminated by
+*commit* or *abort*, that the system must make appear as an indivisible unit. The transfer
+"move 30 from *A* to *B*" is the canonical example: a write on *A* (debit) *and* a write on *B*
+(credit), which must take effect together or not at all — partial effect (a debit without the
+credit) is precisely the anomaly to be excluded. The classical correctness contract is **ACID**
+(Gray; Härder & Reuter):
 
-- **Agreement** — no two participants decide differently.
-- **Commit-Validity** — the decision is COMMIT **only if all participants voted YES**.
-- **Abort-Validity** — the decision is ABORT **only if some participant voted NO or is faulty**.
-- **Termination** — every correct participant **eventually decides**. *(The "non-blocking" clause.)*
+- **Atomicity** — all of the transaction's effects are installed, or none (all-or-nothing under
+  *failure*);
+- **Consistency** — the transaction preserves the application's invariants (here: money is
+  conserved; the deltas sum to zero);
+- **Isolation** — concurrent transactions do not interfere; the standard formalization is
+  **serializability** (equivalence of the concurrent execution to some serial one);
+- **Durability** — once committed, effects survive crashes (stable storage).
 
-2PC gets Agreement + both Validity properties right. **It fails the Termination clause** under
-coordinator failure — which is the whole story of this project. So 2PC implements *atomic commit*, but
-**not** *non-blocking* atomic commit.
+Formal definitions — transactions, histories, serializability and its variants, and the
+relations between these properties — are developed in
+[CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md); this module needs
+atomicity and durability centrally, and touches isolation through locking (§5).
 
-### 3. The protocol — two phases
+When a transaction touches a single node, that node can decide commit/abort locally. When it
+spans several — each of which may be *unable* to perform its part (an overdraft, a violated
+constraint, a crash) — the nodes face an agreement problem: all must reach the *same*
+commit/abort outcome, and commit must be possible only if *every* participant can do its part.
+This is **atomic commitment**.
+
+### 1.3 Specification: non-blocking atomic commitment
+
+Following CCGR §6.1, each participant casts a vote in {YES, NO} and processes decide in
+{COMMIT, ABORT}:
+
+- **NBAC1 (Uniform agreement — safety).** No two processes decide differently (whether or not
+  they subsequently crash).
+- **NBAC2 (Integrity).** No process decides twice.
+- **NBAC3 (Commit-validity).** COMMIT is decided only if *all* participants voted YES.
+- **NBAC4 (Abort-validity).** ABORT is decided only if some participant voted NO or crashed.
+- **NBAC5 (Termination — liveness).** Every correct process eventually decides.
+
+2PC satisfies NBAC1–NBAC4. It fails **NBAC5** under coordinator failure — the subject of §4.
+
+## 2. System model
+
+- **Processes.** One **coordinator** and `n` **participants** `p₁, …, p_n`, each holding one
+  account (balance ∈ ℤ, initially 100). The topology is a **star**: every protocol message is
+  coordinator↔participant; participants never communicate with each other. (This is 2PC as
+  classically defined, and the topology is load-bearing for the blocking result.)
+- **Failures.** Crash-recovery for participants (stable storage; §3.3). The coordinator may
+  crash and, in the blocking demonstration, never recover.
+- **Links.** Perfect point-to-point links (TCP). An unreachable participant is
+  indistinguishable from a crashed one; the coordinator treats a missed reply as a NO
+  (conservative, per NBAC4).
+- **Timing.** Asynchrony suffices for every safety property; the blocking behavior is a
+  *liveness* failure and no timing assumption on the participants' side repairs it (§4.3).
+- **Faults are non-malicious.** Processes follow the protocol or crash; Byzantine behavior
+  (equivocation by the coordinator, false votes) is out of model until Modules 07–08.
+
+## 3. The protocol
+
+A transaction is submitted to the coordinator as per-participant **deltas** — the transfer
+above is `⟨−30 to p₁, +30 to p₂⟩`; the deltas of a well-formed transfer sum to zero — under a
+transaction identifier *txid*.
 
 ```
-                COORDINATOR                         PARTICIPANTS (star topology; they never talk to each other)
-  Phase 1   ── PREPARE <txid> <delta> ─────────►    each: can I apply my delta AND am I free?
-  (voting)                                             YES → durably log "prepared", LOCK, become in-doubt
-            ◄──────── VOTE <txid> YES|NO ─────         NO  → refuse
-                                                    
-            decide: COMMIT iff EVERY vote is YES
-                    ABORT if any NO / any unreachable
-  Phase 2   ── COMMIT | ABORT <txid> ────────────►    COMMIT → apply delta, release lock
-  (decision)                                            ABORT  → discard reservation, release lock
-            ◄──────────── ACK <txid> ──────────────
+Phase 1 (voting)     coordinator → each pᵢ :  PREPARE txid δᵢ
+                     each pᵢ → coordinator :  VOTE txid {YES | NO}
+
+     decision rule:  COMMIT  iff  every participant replied VOTE YES
+                     ABORT   otherwise (any NO, or any missing reply)
+
+Phase 2 (decision)   coordinator → each pᵢ :  COMMIT txid | ABORT txid
+                     each pᵢ → coordinator :  ACK txid
 ```
 
-The key state is a participant's **in-doubt** window: from the moment it votes YES until it hears the
-verdict, it has made a **binding promise** it cannot take back, and it **holds a lock** (refuses other
-transactions). A YES is not an opinion — it is a guarantee the coordinator may already have acted on.
+### 3.1 Phase 1 — voting
 
-### 4. The blocking flaw (2PC's fatal weakness)
+On `PREPARE txid δ`, a participant votes YES iff it *can and may* apply δ: the balance would
+remain non-negative, **and** it holds no other in-doubt transaction. Before replying YES it
+must:
 
-If the coordinator crashes **after** collecting votes but **before** broadcasting the verdict, every
-participant that voted YES is stranded **in-doubt**:
+1. **record the vote durably** — write `(txid, δ)` to stable storage and `fsync` it, *then*
+   reply (persist-before-externalize, exactly as in Module 05 §4); and
+2. **enter the in-doubt state** — set `prepared = (txid, δ)`, reserving the resources. From
+   this point the participant has issued a *promise*: it guarantees it will be able to commit
+   δ if told to. It must refuse conflicting work (here: any other PREPARE) until released.
 
-- It **cannot decide alone.** COMMIT might contradict an ABORT the coordinator already sent someone;
-  ABORT might contradict a COMMIT. Either guess can violate Agreement.
-- It **cannot ask its peers** — the topology is a **star**; participants have no channel to each other
-  and never saw the other votes (only the coordinator did).
-- It **cannot escape by restarting** — the in-doubt lock is *durable* (§stable storage), so a reboot
-  brings it back *still in-doubt*. Persistence buys **safety**, not **liveness**.
+A YES vote is thus binding and durable; a NO vote requires neither durability nor a lock, since
+NO forces ABORT regardless of anything else (NBAC3).
 
-So the lock is held **forever**, and every future transaction touching that data is refused. The
-cluster is wedged. See `demos/blocking.py`. This is exactly the **Termination** clause of NBAC (§2)
-failing.
+### 3.2 Phase 2 — decision
 
-### 5. Why *consensus ≠ atomic commit* (and why NBAC is, in one sense, harder)
+The coordinator computes the outcome — the logical conjunction of the votes — and imposes it.
+On `COMMIT txid`, a participant with `prepared = (txid, δ)` applies δ to its balance, clears
+`prepared`, persists, and acknowledges. On `ABORT txid`, it discards the reservation (balance
+untouched), clears `prepared`, persists, and acknowledges. In both cases the *release of the
+in-doubt state* happens only here — the shrinking phase of the lock discipline (§5).
 
-They look similar (both "agree on one value") but differ on two axes:
+### 3.3 Correctness of the non-liveness properties
 
-- **Decision function.** Consensus may decide *any proposed* value. Atomic commit's outcome is a
-  *function of the votes* — COMMIT **iff all YES** (a logical AND). One NO forces ABORT.
-- **Fault tolerance / quorum.** Consensus tolerates a minority of crashes (majority still decides —
-  `05`). Atomic commit needs *every* participant's YES; one crash forces ABORT, and a *coordinator*
-  crash **blocks**.
+*NBAC1:* the only source of decisions is the single coordinator, which computes one outcome per
+txid and sends the same verdict to all. *NBAC3:* COMMIT requires the full conjunction of YES
+votes; a single NO — or an unreachable participant, whose vote cannot be confirmed — yields
+ABORT. *NBAC4:* ABORT arises only from a NO or a missing (crashed/unreachable) participant.
+*Durability of the outcome at a participant:* a participant that voted YES has its vote on
+stable storage; if it crashes and recovers, it is *still in doubt* — it comes back holding
+`(txid, δ)` and awaiting the verdict, so a crash cannot cause it to forget a promise the
+coordinator may already have acted on (the double-vote / lost-commit anomaly is excluded, as
+demonstrated in `demos/persistence.py`).
 
-The sharp, formal way to say it (CCGR): **NBAC requires a *perfect* failure detector P**, whereas
-consensus needs only an *eventually perfect* one (◇P / Ω). Why? Because Abort-Validity ties the
-decision to whether a participant **crashed** — and to decide COMMIT you must be *sure* nobody has
-crashed, which only P (never a false suspicion, never a missed crash) can tell you. Consensus can
-tolerate the false suspicions of ◇P because it doesn't have to distinguish "slow" from "dead" to be
-*safe*. In the failure-detector hierarchy, **NBAC sits *above* consensus.**
+## 4. The blocking behavior
 
-### 6. The fixes (out of scope, but where the road leads)
+### 4.1 The execution
 
-- **3PC (three-phase commit).** Adds a "pre-commit" phase so a stranded participant can run a
-  *termination protocol* (ask peers) and decide. Non-blocking **under synchrony + no partitions** —
-  but unsafe under network partitions, so rarely used in practice.
-- **Paxos Commit (Gray & Lamport, 2006).** The real fix: replace the single fragile coordinator with
-  a **consensus group**, and run the *commit decision itself* through consensus (`05`). Now no single
-  failure strands anyone. This is literally **2PC layered on top of Raft/Paxos** — which is how
-  Spanner and CockroachDB do cross-shard transactions: each shard is a Raft group (replication), and
-  a multi-shard transaction runs 2PC over the shard-leaders (atomic commit).
+Let the coordinator crash *after* collecting a full set of YES votes and *before* delivering
+any verdict. Every participant is in doubt, and:
 
----
+- **it cannot decide unilaterally.** Deciding ABORT may contradict a COMMIT the coordinator
+  already sent to some other participant before crashing (violating NBAC1); deciding COMMIT may
+  likewise contradict an ABORT. Both outcomes are consistent with the participant's local
+  state — this is precisely what "in doubt" means;
+- **it cannot consult its peers** — the star topology provides no participant↔participant
+  channel, and no participant saw any vote but its own;
+- **it cannot escape by restarting** — by §3.1 the in-doubt state is durable, so recovery
+  returns it to the same state. (Volatility would restore liveness at the price of safety:
+  a recovered participant that forgot its YES could vote for a conflicting transaction.)
 
-## Deep dive — locking, 2PL, and what `prepared` really is
+The participant therefore waits indefinitely, holding its reservation; every future transaction
+that touches the reserved resources is refused. NBAC5 fails. The demonstration
+`demos/blocking.py` stages exactly this execution (a coordinator that stops after Phase 1) and
+then shows a subsequent, well-formed transaction being refused by every participant.
 
-The participant's `prepared` state is not just a flag; it is a **lock**, and 2PC is doing **Two-Phase
-Locking** across machines. This section connects the code to the transaction-isolation theory (fuller
-treatment in [`CONSISTENCY_AND_CONCURRENCY.md §6`](../CONSISTENCY_AND_CONCURRENCY.md)).
+### 4.2 Blocking is not deadlock
 
-### Growing and shrinking phases
+The stranded participant is not in a waiting *cycle*: it awaits a single external event (the
+verdict) that will never arrive. The distinction matters because the standard remedies differ —
+deadlock is broken by victim selection or ordering; blocking here can only be resolved by
+supplying the missing event from elsewhere, which is exactly what the repairs of §6 do.
 
-**Two-Phase Locking (2PL)** — the discipline that guarantees **serializability** (specifically
-*conflict*-serializability) — splits a transaction's lifetime by one rule:
+### 4.3 The theoretical position
 
-- **Growing phase** — may **acquire** locks, may **not release** any.
-- **Shrinking phase** — may **release** locks, may **not acquire** any new ones.
+The blocking of 2PC is not an implementation defect but the shadow of a genuine impossibility
+gap. In the failure-detector hierarchy, NBAC is *harder* than consensus: consensus is solvable
+with the eventual leader detector Ω and a correct majority (Module 05), whereas NBAC in general
+requires the **perfect** failure detector *P* — deciding COMMIT requires certainty that no
+participant has crashed (NBAC4 ties the outcome to crashes), and certainty about crashes is
+exactly what no eventually-accurate detector provides (CCGR Ch. 6 develops NBAC from consensus
+plus a perfect failure detector). Two consequences follow: under partial synchrony one should
+*expect* atomic commitment to inherit consensus's machinery rather than avoid it; and the
+"unanimity vs. majority" contrast with Module 05 is a difference in *validity properties*, not
+merely in engineering.
 
-Once you release your first lock you can never grab another, so there is a single **peak** where the
-transaction holds *all* its locks at once — that peak is its **serialization point**, which is what
-makes the schedule equivalent to a serial order. *(Unlucky naming: 2P**L**'s two phases are unrelated
-to 2P**C**'s prepare/commit phases.)*
-
-### Plain vs Strict vs Rigorous 2PL
-
-| Variant | Releases locks… | Prevents |
+| | Consensus (05) | Atomic commitment (06) |
 |---|---|---|
-| **Plain 2PL** | as soon as done with an object (but no acquire after any release) | non-serializable schedules — but still allows **cascading aborts** / non-recoverable schedules (a peer can read an uncommitted write) |
-| **Strict 2PL** | holds all **write (exclusive)** locks until **commit/abort**, then releases | cascading aborts; guarantees **recoverable, cascadeless** schedules |
-| **Rigorous 2PL** | holds **all** locks (read *and* write) until commit/abort | same, and simplest to reason about — the common industrial choice |
+| decision function | any proposed value | conjunction of votes (COMMIT iff all YES) |
+| decision quorum | majority | all participants, via one coordinator |
+| detector needed | ◇P / Ω (with majority) | P (in general) |
+| coordinator/leader crash | new leader elected; progress resumes | participants block in doubt |
 
-### `prepared` **is** Strict 2PL across machines
+## 5. The in-doubt state is a lock: strict two-phase locking
 
-Map the code onto the theory:
+The participant's `prepared` field is not merely protocol bookkeeping; it is an **exclusive
+lock** on the participant's resources, held according to **strict two-phase locking (2PL)**.
 
-- **Acquire (growing)** — voting `VOTE YES` sets `prepared = Some((txid, delta))`: the participant
-  **locks** its account. It refuses any other transaction while holding it (`prepared.is_none()` guard).
-- **Hold** — it keeps the lock from the YES vote all the way through the transaction, releasing
-  **nothing** early.
-- **Release (shrinking, at the very end)** — `COMMIT`/`ABORT` clears `prepared`: locks released **at
-  commit/abort time**, all at once.
+**Two-phase locking.** A transaction's lock acquisitions all precede its lock releases: a
+*growing* phase (acquire only) followed by a *shrinking* phase (release only). Basic 2PL
+guarantees conflict-serializability. **Strict 2PL** further holds all *exclusive* locks until
+commit/abort, which additionally provides recoverability and precludes cascading aborts
+(**rigorous 2PL** holds shared locks too). The naming collision is unfortunate and worth
+flagging once: 2P*C*'s phases (vote, decide) and 2P*L*'s phases (grow, shrink) are unrelated.
 
-That "hold the exclusive lock until the verdict" is exactly **Strict 2PL** — and it is *why* no reader
-can observe a half-applied transfer (isolation), *and* why a dead coordinator (verdict never comes)
-holds the lock **forever**. **The blocking flaw is a stuck 2PL lock:** the shrinking phase never
-happens.
+The correspondence: voting YES *acquires* the lock (growing phase — and the participant's
+refusal of further PREPAREs while in doubt is exactly conflict prevention); the verdict
+*releases* it (shrinking phase, at commit/abort — strict 2PL precisely). This yields the
+module's sharpest formulation of §4:
 
----
+> **The blocking of 2PC is a strict-2PL lock whose shrinking phase never arrives.** Holding
+> locks to the verdict is what makes the protocol's isolation and recoverability correct; the
+> same discipline is what makes a lost verdict catastrophic.
 
-## How this project evolved — one problem at a time
+The full treatment of 2PL and its variants, serializability, and the mechanism/guarantee
+distinction is in [CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md) §§4–6.
 
-| # | We built… | …which exposed |
-|---|---|---|
-| **M1** | **happy path** — coordinator drives PREPARE → collect votes → COMMIT; participants apply | a single-participant tx wouldn't need any of this — the hard part is *multiple* shards |
-| **M1½** | **abort / atomicity** — one NO (insufficient funds) vetoes everyone; a YES-voter still doesn't apply | the YES vote is a *promise*, and a promise costs a **lock** held until the verdict |
-| **M2** | **durability** — fsync `balance` + the in-doubt `prepared` **before every reply**; reload on restart | a durable lock is **safe** (never breaks a promise) but now **can't be forgotten to escape blocking** |
-| **M3** | **the blocking flaw** — `transfer-crash` kills the coordinator after PREPARE | 2PC is **safe but not live**: the stranded lock is held forever — *consensus would have survived this* |
+## 6. Repairs: toward non-blocking atomic commitment
 
-The arc: **commit** (M1) → **veto & lock** (M1½) → **make the lock durable** (M2) → **watch it block**
-(M3).
+- **Cooperative termination / three-phase commit** (Skeen 1981). Adding a *pre-commit* round
+  and letting in-doubt participants poll one another allows termination when failures are
+  crash-stop and the network is synchronous; under partitions 3PC can violate safety, and it is
+  rarely deployed.
+- **Paxos Commit** (Gray & Lamport 2006). The principled repair, given §4.3: make the *decision
+  itself* fault-tolerant by running it through consensus. Each participant's vote is registered
+  in a consensus instance (or the coordinator is a replicated state machine); no single crash
+  can then withhold the verdict. 2PC is the degenerate case with one acceptor.
+- **The layered architecture.** Production systems compose both regimes of §1.1: data is
+  partitioned into shards, each shard is *replicated* as a consensus group (Module 05), and
+  cross-shard transactions run *atomic commitment* (this module) across shard leaders, with the
+  per-shard groups standing in for both durable participants and a durable coordinator. Google
+  Spanner is the canonical example (2PC over Paxos groups); CockroachDB's parallel commit is an
+  optimized variant over Raft ranges.
 
----
+## 7. Correspondence between theory and code
 
-## How the code reflects the theory — and where it stops
-
-| Theory | In this code |
+| Concept | Realization |
 |---|---|
-| atomic commit over partitions | coordinator sends a per-participant `delta`; `deltas[i]` → `participants[i]` |
-| Commit-Validity (unanimity / AND) | `all_yes` — COMMIT only if **every** reply is exactly `VOTE <txid> YES` |
-| Abort-Validity (a NO or a crash aborts) | a NO vote *or* an unreachable participant (`send` → `None`) ⇒ not-YES ⇒ ABORT |
-| in-doubt / Strict 2PL lock | `prepared: Option<(u64, i64)>`; set on YES, held until verdict, cleared on COMMIT/ABORT |
-| durability / stable storage (CCGR §2.2.4) | `persist()` fsyncs `balance` + `prepared` **before every reply**; `load()` reloads on startup |
-| the blocking flaw | `transfer-crash` reaches "votes collected, no verdict" and stops → participants wedged |
+| transaction over partitions | per-participant deltas: `transfer δ₁ δ₂ …`, `δᵢ → participantᵢ` |
+| NBAC3 (commit-validity) | `all_yes`: COMMIT iff every reply equals `VOTE txid YES` |
+| NBAC4 (abort-validity) | a NO vote *or* an unreachable participant (`send → None`) forces ABORT |
+| in-doubt state / strict-2PL lock | `prepared: Option<(u64, i64)>`; set on YES, refused-while-held, cleared on verdict |
+| durable vote (persist-before-externalize) | `persist()` fsyncs balance + `prepared` before replying; `load()` restores on restart |
+| the blocking execution | the `transfer-crash` command: run Phase 1, then stop — no verdict is ever sent |
 
-**Honest limits — the syllabus beyond this project (each a signpost):**
+Implementation notes. The participant is deliberately **passive and sequential** — a single
+accept loop, no shared-state concurrency (contrast Module 05's timer thread and
+`Arc<Mutex<State>>`): it takes no step except in response to the coordinator. This passivity is
+the architectural mirror of the blocking result — a process with no autonomous behavior has no
+mechanism by which to rescue itself. The coordinator's `transfer-crash` is a test hook that
+realizes the §4.1 crash point deterministically, in the tradition of fault injection.
 
-- **The coordinator is a single point of failure (by design).** It is neither replicated nor
-  persistent — that *is* the blocking flaw we set out to show. The fix is **Paxos Commit** (§6): run
-  the decision through consensus (`05`). *(→ fault-tolerant coordinator.)*
-- **No participant timeout / termination protocol.** A stranded participant waits **forever**; it
-  never times out to ask peers or presume-abort. Real systems add timeouts + a cooperative
-  termination protocol (and **presumed-abort/presumed-commit** log optimizations). *(→ 3PC,
-  termination protocols.)*
-- **Transaction ids aren't globally unique across coordinator restarts.** `txid` is an in-memory
-  counter, so a *restarted* coordinator reuses ids — and a new tx's `ABORT` could then wrongly match
-  (and release) an old in-doubt lock: a real safety hole. The fix is a persistent/coordinated txid
-  (which Paxos Commit gets for free from the consensus layer). *(→ globally-unique txids.)*
-- **Coarse, whole-node locking.** A participant holds *one* in-doubt tx at a time (one lock for the
-  whole account), so concurrent transactions serialize hard. Real systems lock at row granularity.
-  *(→ fine-grained locking.)*
-- **Sequential Phase 1.** The coordinator sends PREPAREs one participant at a time; a real one fans
-  them out concurrently. *(An optimization, not a correctness gap.)*
-- **No recovering-coordinator re-attach.** A restarted coordinator has no "who is in-doubt?" query to
-  reconnect to stranded participants and finish the job. *(→ coordinator recovery.)*
+## 8. Limitations and outlook
+
+- **The coordinator is a deliberate single point of failure** — the object of study. The repair
+  is Paxos Commit (§6). *(→ Exercise 5.)*
+- **Transaction identifiers are not unique across coordinator restarts.** The txid counter is
+  volatile; a restarted coordinator reuses identifiers, and a new transaction's ABORT could
+  then wrongly release an unrelated in-doubt lock — a genuine safety defect, found during
+  development. Persistent or consensus-allocated txids repair it. *(→ Exercise 3.)*
+- **Whole-node locking.** One in-doubt transaction at a time per participant; real systems lock
+  at item granularity, admitting concurrent disjoint transactions.
+- **Sequential Phase 1** (an optimization, not a correctness issue); no presumed-abort /
+  presumed-commit log optimizations; no coordinator-recovery protocol to re-adopt in-doubt
+  participants after a restart.
+
+## 9. Exercises
+
+1. **(In-doubt reasoning.)** In the execution of §4.1, suppose an in-doubt participant
+   unilaterally aborts after a timeout. Construct the completion of the execution that violates
+   NBAC1. Then explain why a timeout on the *coordinator's* side (aborting when a vote is slow)
+   is, by contrast, always safe.
+2. **(Presumed abort.)** In industrial 2PC, a coordinator that finds no record of a txid answers
+   ABORT ("presumed abort"), letting it forget aborted transactions. Specify precisely which log
+   writes this removes, and re-verify NBAC1/NBAC4 under coordinator crash-recovery.
+3. **(Identifier discipline.)** Demonstrate the txid-collision defect against the current code
+   (two coordinator sessions), then repair it (persist the counter, or derive txids from a
+   durable epoch) and re-run the demonstration.
+4. **(Termination protocol.)** Add a participant↔participant channel and implement cooperative
+   termination: an in-doubt participant polls its peers; if any has decided, it adopts that
+   decision; if any has *not voted*, all may abort. Which executions of §4.1 does this rescue,
+   and which (all participants in doubt) remain blocked?
+5. **(Paxos Commit, on paper.)** Design — at the level of messages and state — atomic
+   commitment for this module's transfer using Module 05's Raft as a service: where do votes
+   live, who proposes the outcome, and why does a coordinator crash no longer block? Compare
+   message counts with plain 2PC in the failure-free case.
+6. **(2PL.)** Give a two-transaction, two-account schedule admitted if participants release
+   their reservation immediately after voting (violating strict 2PL) that is not
+   conflict-serializable, and verify the current implementation refuses it.
+
+## References
+
+**Reference text**
+- C. Cachin, R. Guerraoui, L. Rodrigues, *Introduction to Reliable and Secure Distributed
+  Programming*, 2nd ed., Springer, 2011. For this module: non-blocking atomic commitment
+  (§6.1); consensus (Ch. 5); failure detectors P vs. ◇P (§2.6). ISBN 978-3-642-15259-7.
+
+**Atomic commitment**
+- J. Gray, *Notes on Data Base Operating Systems*, in *Operating Systems: An Advanced Course*,
+  Springer LNCS 60, 1978. (2PC.)
+- D. Skeen, *Nonblocking Commit Protocols*, SIGMOD 1981. (Blocking analysis; 3PC.)
+- P. Bernstein, V. Hadzilacos, N. Goodman, *Concurrency Control and Recovery in Database
+  Systems*, Addison-Wesley, 1987. (2PC, 2PL, recovery; freely available online.)
+- J. Gray, L. Lamport, *Consensus on Transaction Commit*, ACM TODS 31(1), 2006. (Paxos Commit.)
+
+**Transactions and isolation**
+- T. Härder, A. Reuter, *Principles of Transaction-Oriented Database Recovery*, ACM Computing
+  Surveys 15(4), 1983. (ACID.)
+- J. Gray, A. Reuter, *Transaction Processing: Concepts and Techniques*, Morgan Kaufmann, 1993.
+- C. H. Papadimitriou, *The Serializability of Concurrent Database Updates*, JACM 26(4), 1979.
+
+**Systems**
+- J. C. Corbett et al., *Spanner: Google's Globally-Distributed Database*, OSDI 2012.
+  (2PC over Paxos groups.)
 
 ---
 
-## Run
+## Running the code
 
 ```bash
 cargo build
 ```
 
-Start a **2-node cluster** (two bank branches, each starting at $100):
+Start two participants (accounts, initial balance 100):
 ```bash
 cargo run -- participant 6000
 cargo run -- participant 6001
 ```
-Then drive them with a coordinator (reads commands from stdin):
+Drive them with a coordinator (commands on stdin):
 ```bash
 cargo run -- coordinator 127.0.0.1:6000 127.0.0.1:6001
-transfer -30 30        # move $30 from p0 to p1 → COMMIT (both can afford)
-transfer -150 150      # p0 can't afford → NO → ABORT (nobody applies)
-transfer-crash -30 30  # coordinator dies after PREPARE → participants wedged in-doubt
+transfer -30 30        # both can perform their part → COMMIT
+transfer -150 150      # p₁ cannot (overdraft) → NO → ABORT; neither balance changes
+transfer-crash -30 30  # coordinator stops after Phase 1 → participants blocked in doubt
 ```
-`transfer <d0> <d1> …` maps `deltas[i]` to `participants[i]`; they should sum to zero (money is
-conserved). `transfer-crash` is a test hook that runs Phase 1 then stops — modelling a coordinator
-crash at the worst moment.
-
-**Wire protocol** (newline-framed):
-
-| Message | Direction | Meaning |
-|---|---|---|
-| `PREPARE <txid> <delta>` → `VOTE <txid> YES\|NO` | coordinator → participant | Phase 1: can you apply your delta (and are you free)? |
-| `COMMIT <txid>` / `ABORT <txid>` → `ACK <txid>` | coordinator → participant | Phase 2: the unanimous verdict |
-
-**Demos** (`demos/`) drive a real cluster over TCP:
-
-| Script | Shows |
-|---|---|
-| `happy.py` | all YES → **COMMIT**; both apply (100→70, 100→130) |
-| `abort.py` | one NO → **ABORT**; a YES-voter locks but does **not** apply (atomicity) |
-| `persistence.py` | committed state **and** the in-doubt lock survive a crash; a reboot doesn't unblock |
-| `blocking.py` | coordinator dies after PREPARE → participants **wedged in-doubt forever** |
-
-## Design & notable implementation details
-
-- **A participant is passive and sequential** — no `Arc<Mutex>` (unlike `05`). It has no timer, no
-  initiative; it only reacts to the coordinator, one message at a time, so a plain `for conn in
-  listener.incoming()` loop over local `balance`/`prepared` variables is race-free. That passivity is
-  itself the reason a stranded participant can't self-rescue.
-- **The star topology is the whole story.** Every message comes from the coordinator; participants
-  never message each other. Centralizing the decision keeps each participant trivial — and makes the
-  coordinator's death unrecoverable.
-- **Persist before you externalize.** `fsync` the promise *before* replying YES, the new balance
-  *before* acking COMMIT — otherwise a crash could break a promise the coordinator already relied on.
-- **`send` returning `None` = a NO.** An unreachable participant can't confirm YES, so treating a
-  connection failure as not-a-yes is exactly Abort-Validity: uncertainty ⇒ abort.
-
-## What I learned
-
-*Rust:* a passive single-threaded TCP server (no shared-state locking needed — a nice contrast with
-`05`); `Option<(u64, i64)>` as a durable lock; slice-pattern command parsing (`["PREPARE", txid,
-delta]`, `deltas @ ..`); `str::parse` with `if let (Some(Ok(..)), ..)`; fsync via `File::create` +
-`sync_all()`; and reading state back on startup.
-
-*Distributed systems:* **atomic commit** vs **consensus** (unanimity/AND + perfect FD vs
-majority + ◇P); the **NBAC** properties and which one 2PC breaks (**Termination**); the **in-doubt**
-window as a **Strict 2PL** lock (acquire on YES, hold to the verdict, release at commit/abort); why
-**durability strengthens blocking** rather than curing it; **partitioning vs replication**; and the
-fix — **Paxos Commit** = atomic commit *over* consensus.
+Per-participant state persists in `2pc-<port>.state`. The `demos/` scripts (`happy.py`,
+`abort.py`, `persistence.py`, `blocking.py`) reproduce §3–§4 end to end.
 
 ---
-
-## References
-
-**Course reference text**
-- Christian Cachin, Rachid Guerraoui & Luís Rodrigues, *Introduction to Reliable and Secure
-  Distributed Programming*, 2nd ed., Springer, 2011. For `06`: **Non-Blocking Atomic Commit** (§6.1),
-  **consensus** (Ch. 5), **failure detectors** P vs ◇P (§2.6). ISBN 978-3-642-15259-7.
-
-**Atomic commit**
-- Jim Gray, *Notes on Data Base Operating Systems*, 1978. The original **two-phase commit** protocol.
-- Philip Bernstein, Vassos Hadzilacos & Nathan Goodman, *Concurrency Control and Recovery in Database
-  Systems*, Addison-Wesley, 1987. 2PC, 3PC, 2PL, recovery — the canonical text (freely online).
-- Dale Skeen, *Nonblocking Commit Protocols*, ACM SIGMOD 1981. Why 2PC blocks; **three-phase commit**.
-- Jim Gray & Leslie Lamport, *Consensus on Transaction Commit*, ACM TODS 31(1), 2006. **Paxos
-  Commit** — the non-blocking fix that runs the decision through consensus.
-
-**Isolation & locking (see also `CONSISTENCY_AND_CONCURRENCY.md`)**
-- Jim Gray & Andreas Reuter, *Transaction Processing: Concepts and Techniques*, 1993. ACID, 2PL.
-- C. H. Papadimitriou, *The Serializability of Concurrent Database Updates*, JACM 1979.
-
----
-Part of [distributed-systems-in-rust](../).  ·  Theory maps: [CONSENSUS.md](../05-raft/CONSENSUS.md) · [CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md)
+*[Course home](../) · Previous: [Module 05](../05-raft/) · Next: Module 07 — Byzantine Reliable
+Broadcast (planned) · Theory maps: [CONSENSUS.md](../05-raft/CONSENSUS.md) ·
+[CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md)*
