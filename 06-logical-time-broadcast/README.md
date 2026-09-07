@@ -13,7 +13,8 @@ Planned content:
   (consistent with happens-before) and **vector clocks** (characterizing it exactly).
 - **The broadcast hierarchy** (CCGR Ch. 3): best-effort, (uniform) reliable, FIFO, causal, and
   **total-order broadcast**, each specified by its properties and implemented over the
-  perfect-links layer of Module 02.
+  perfect-links layer of Module 02. ([Module 10](../10-byzantine-broadcast/) §2 gives the
+  compressed specification tour of the crash-model rungs; this module *implements* them.)
 - **Total-order broadcast ⟺ consensus** (CCGR Ch. 6): the reduction in both directions — the
   theoretical reason Module 07's replicated log is a consensus problem.
 - **Consistent global snapshots** as an application of causality: Chandy–Lamport marker
