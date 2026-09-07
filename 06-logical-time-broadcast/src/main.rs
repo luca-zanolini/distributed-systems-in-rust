@@ -5,16 +5,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 enum Message {
-    Data { from: String, m: String },
+    Data { from: String, lc: u64, m: String },
 }
 
 fn encode(msg: &Message) -> String {
     match msg {
-        Message::Data { from, m } => format!("DATA {from} {m}\n"),
+        Message::Data { from, lc, m } => format!("DATA {from} {lc} {m}\n"),
     }
 }
 
 struct State {
+    lc: u64,
     delivered: std::collections::HashSet<(String, String)>,
 }
 
@@ -23,9 +24,12 @@ fn decode(s: &str) -> Option<Message> {
 
     match kind {
         "DATA" => {
-            let (from, m) = value.split_once(' ')?;
+            let (from, rest) = value.split_once(' ')?;
+            let (lc_str, m) = rest.split_once(' ')?;
+            let lc = lc_str.parse::<u64>().ok()?;
             Some(Message::Data {
                 from: from.to_string(),
+                lc,
                 m: m.to_string(),
             })
         }
@@ -58,6 +62,7 @@ fn main() {
         .collect();
 
     let state: Arc<Mutex<State>> = Arc::new(Mutex::new(State {
+        lc: 0,
         delivered: std::collections::HashSet::new(),
     }));
 
@@ -65,51 +70,55 @@ fn main() {
 
     {
         let me = me.clone();
-            let peers = peers.clone();
-            thread::spawn(move || {
-                for line in std::io::stdin().lock().lines() {
-                    let Ok(line) = line else { break };
-                    let parts: Vec<&str> = line.split_whitespace().collect();
+        let peers = peers.clone();
+        let state = state.clone();
+        thread::spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                let parts: Vec<&str> = line.split_whitespace().collect();
 
-                    match parts.as_slice() {
-                        ["bcast", m] => {
-                            eprintln!("Broadcasting: {m}");
-                            broadcast(
-                                &peers,
-                                &me,
-                                &Message::Data {
-                                    from: me.clone(),
-                                    m: m.to_string(),
-                                },
-                            );
-                        }
-                                                ["bcast", "equiv", m, n] => {
-                            eprintln!("Equivocating: {m} / {n}");
-                            let half = peers.len() / 2;
-                            broadcast(
-                                &peers[..half],
-                                &me,
-                                &Message::Data {
-                                    from: me.clone(),
-                                    m: m.to_string(),
-                                },
-                            );
-                            broadcast(
-                                &peers[half..],
-                                &me,
-                                &Message::Data {
-                                    from: me.clone(),
-                                    m: n.to_string(),
-                                },
-                            );
-                        }
-                        _ => {
-                            eprintln!("Unknown command");
-                        }
+                match parts.as_slice() {
+                    ["bcast", m] => {
+                        let mut state = state.lock().unwrap(); // guard: now `state` IS the State (via Deref)
+                        state.lc += 1;
+                        let stamped = Message::Data {
+                            from: me.clone(),
+                            lc: state.lc,
+                            m: m.to_string(),
+                        };
+                        eprintln!("Broadcasting: {m} with lc={}", state.lc);
+                        broadcast(&peers, &me, &stamped);
+                    }
+                    ["bcast", "equiv", m, n] => {
+                        eprintln!("Equivocating: {m} / {n}");
+                        let mut state = state.lock().unwrap();
+                        state.lc += 1;
+                        let half = peers.len() / 2;
+                        broadcast(
+                            &peers[..half],
+                            &me,
+                            &Message::Data {
+                                from: me.clone(),
+                                lc: state.lc,
+                                m: m.to_string(),
+                            },
+                        );
+                        broadcast(
+                            &peers[half..],
+                            &me,
+                            &Message::Data {
+                                from: me.clone(),
+                                lc: state.lc,
+                                m: n.to_string(),
+                            },
+                        );
+                    }
+                    _ => {
+                        eprintln!("Unknown command");
                     }
                 }
-            });
-
+            }
+        });
     }
 
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).unwrap();
@@ -122,17 +131,22 @@ fn main() {
         }
         if let Some(msg) = decode(&line) {
             match msg {
-                Message::Data { from, m } => {
+                Message::Data { from, lc, m } => {
                     // on DATA { origin, m }:
                     let mut state = state.lock().unwrap();
+                    state.lc = state.lc.max(lc) + 1;
                     if !state.delivered.contains(&(from.clone(), m.clone())) {
                         state.delivered.insert((from.clone(), m.clone()));
-                        eprintln!("Delivered from {from}: {m}");
+                        eprintln!(
+                            "Delivered from {from}: {m} [msg.lc={lc}, my.lc={}]",
+                            state.lc
+                        );
                         broadcast(
                             &peers,
                             &me,
                             &Message::Data {
                                 from: from.clone(),
+                                lc: state.lc,
                                 m: m.clone(),
                             },
                         );
