@@ -41,7 +41,7 @@ placeholders mark modules whose notes and code are still to come.)
 | 03 | [Shared-Memory Concurrency](03-shared-memory-concurrency/) — semaphores, monitors, deadlock, lock-free | mutual exclusion; progress properties | 🔲 planned |
 | 04 | [Replication and Quorums](04-replicated-kv-store/) — the (1, N) regular register | majority voting (§4.2.3); quorums (§2.7.3) | ✅ |
 | 05 | [Failure Detection and Leader Election](05-leader-election/) — ◇P and Ω from heartbeats | failure detectors & Ω (§2.6); timing (§2.5) | ✅ |
-| 06 | [Logical Time and Broadcast](06-logical-time-broadcast/) — Lamport/vector clocks; FIFO/causal/total order | broadcast hierarchy (Ch. 3); TOB ⟺ consensus | 🔲 planned |
+| 06 | [Logical Time and Broadcast](06-logical-time-broadcast/) — eager RB, Lamport/vector clocks, causal broadcast | reliable broadcast (Alg. 3.3); causal order (Alg. 3.15) | ✅ Part I *(TOB over Raft planned)* |
 | 07 | [Consensus: Raft](07-raft/) — terms, replicated log, majority commit, safety, persistence | uniform consensus, leader-driven (Ch. 5) | ✅ |
 | 08 | [Atomic Commitment: 2PC](08-two-phase-commit/) — transactions, unanimity, blocking, strict 2PL | NBAC (§6.1); P vs. ◇P | ✅ |
 | 09 | [Concurrency Control](09-concurrency-control/) — 2PL, OCC, MVCC; anomalies as tests | serializability mechanisms | 🔲 planned |
