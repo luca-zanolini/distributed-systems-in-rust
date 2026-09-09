@@ -69,16 +69,22 @@ fn decode(s: &str) -> Option<Message> {
     }
 }
 
-fn broadcast(peers: &[String], me: &str, message: &Message) {
+fn send_to(targets: &[String], message: &Message) {
     let msg = encode(message);
-    for peer in peers.iter().cloned().chain(std::iter::once(me.to_string())) {
+    for target in targets.iter().cloned() {
         let msg = msg.clone();
         std::thread::spawn(move || {
-            if let Ok(mut stream) = TcpStream::connect(&peer) {
+            if let Ok(mut stream) = TcpStream::connect(&target) {
                 let _ = stream.write_all(msg.as_bytes());
             }
         });
     }
+}
+
+fn broadcast(peers: &[String], me: &str, message: &Message) {
+    let mut targets: Vec<String> = peers.iter().cloned().collect();
+    targets.push(me.to_string());
+    send_to(&targets, message);
 }
 
 fn main() {
@@ -136,18 +142,16 @@ fn main() {
                         ["bcast", "equiv", m, n] => {
                             eprintln!("Equivocating: {m} / {n}");
                             let half = peers.len() / 2;
-                            broadcast(
+                            send_to(
                                 &peers[..half],
-                                &me,
                                 &Message::PrePrepare {
                                     from: me.clone(),
                                     view: 0,
                                     m: m.to_string(),
                                 },
                             );
-                            broadcast(
+                            send_to(
                                 &peers[half..],
-                                &me,
                                 &Message::PrePrepare {
                                     from: me.clone(),
                                     view: 0,
