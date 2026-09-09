@@ -3,6 +3,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 fn port_of(addr: &str) -> u16 {
     addr.rsplit(':')
@@ -12,9 +14,26 @@ fn port_of(addr: &str) -> u16 {
 }
 
 enum Message {
-    PrePrepare { from: String, view: u64, m: String },
-    Prepare { from: String, view: u64, m: String },
-    Commit { from: String, view: u64, m: String },
+    PrePrepare {
+        from: String,
+        view: u64,
+        m: String,
+    },
+    Prepare {
+        from: String,
+        view: u64,
+        m: String,
+    },
+    Commit {
+        from: String,
+        view: u64,
+        m: String,
+    },
+    ViewChange {
+        from: String,
+        newview: u64,
+        prepared: Option<(u64, String)>,
+    },
 }
 
 fn encode(msg: &Message) -> String {
@@ -22,16 +41,32 @@ fn encode(msg: &Message) -> String {
         Message::PrePrepare { from, view, m } => format!("PREPREPARE {from} {view} {m}\n"),
         Message::Prepare { from, view, m } => format!("PREPARE {from} {view} {m}\n"),
         Message::Commit { from, view, m } => format!("COMMIT {from} {view} {m}\n"),
+        Message::ViewChange {
+            from,
+            newview,
+            prepared,
+        } => {
+            let prepared_str = if let Some((v, m)) = prepared {
+                format!("{v} {m}")
+            } else {
+                "-".to_string()
+            };
+            format!("VIEWCHANGE {from} {newview} {prepared_str}\n")
+        }
     }
 }
 
 struct State {
     view: u64,
+    viewchanges: HashMap<String, (u64, Option<(u64, String)>)>, //(per sender: the view they want, the certificate they claim);
     sentcommit: bool,
     decided: bool,
     preprepared: bool,
+    prepared: Option<(u64, String)>,
     prepares: HashMap<String, String>,
     commits: HashMap<String, String>,
+    sent_viewchange: bool,
+    view_entered: Instant,
 }
 
 fn decode(s: &str) -> Option<Message> {
@@ -65,6 +100,21 @@ fn decode(s: &str) -> Option<Message> {
                 m: m.to_string(),
             })
         }
+        "VIEWCHANGE" => {
+            let (from, rest) = value.split_once(' ')?;
+            let (newview, prepared_str) = rest.split_once(' ')?;
+            let prepared = if prepared_str == "-" {
+                None
+            } else {
+                let (v, m) = prepared_str.split_once(' ')?;
+                Some((v.parse().ok()?, m.to_string()))
+            };
+            Some(Message::ViewChange {
+                from: from.to_string(),
+                newview: newview.parse().ok()?,
+                prepared,
+            })
+        }
         _ => None,
     }
 }
@@ -79,6 +129,11 @@ fn send_to(targets: &[String], message: &Message) {
             }
         });
     }
+}
+
+fn leader_of(view: u64, nodes: &[String]) -> String {
+    let index = (view as usize) % nodes.len();
+    nodes[index].clone()
 }
 
 fn broadcast(peers: &[String], me: &str, message: &Message) {
@@ -99,17 +154,23 @@ fn main() {
         .cloned()
         .collect();
 
-    let candidates = std::iter::once(me.clone()).chain(peers.iter().cloned());
-
-    let leader = candidates.min_by_key(|a| port_of(a)).unwrap();
+    let mut nodes: Vec<String> = std::iter::once(me.clone())
+        .chain(peers.iter().cloned())
+        .collect();
+    nodes.sort_by_key(|a| port_of(a));
+    let mut leader = leader_of(0, &nodes);
 
     let state: Arc<Mutex<State>> = Arc::new(Mutex::new(State {
         view: 0,
+        viewchanges: HashMap::new(),
         sentcommit: false,
         decided: false,
         preprepared: false,
+        prepared: None,
         prepares: HashMap::new(),
         commits: HashMap::new(),
+        sent_viewchange: false,
+        view_entered: Instant::now(),
     }));
 
     let n = peers.len() + 1;
@@ -167,6 +228,37 @@ fn main() {
             });
         }
     }
+    {
+        let me = me.clone();
+        let peers = peers.clone();
+        let state = Arc::clone(&state);
+        thread::spawn(move || {
+            loop {
+                let timeout = Duration::from_secs(4);
+                thread::sleep(Duration::from_millis(500));
+                let fire = {
+                    let mut s = state.lock().unwrap();
+                    if !s.decided && !s.sent_viewchange && s.view_entered.elapsed() > timeout {
+                        s.sent_viewchange = true;
+                        Some((s.view + 1, s.prepared.clone()))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((nv, prepared)) = fire {
+                    broadcast(
+                        &peers,
+                        &me,
+                        &Message::ViewChange {
+                            from: me.clone(),
+                            newview: nv,
+                            prepared: prepared,
+                        },
+                    );
+                }
+            }
+        });
+    }
 
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).unwrap();
     for conn in listener.incoming() {
@@ -199,6 +291,7 @@ fn main() {
                     let count = state.prepares.values().filter(|v| **v == m).count();
                     if 2 * count > n + f && !state.sentcommit {
                         state.sentcommit = true;
+                        state.prepared = Some((v, m.clone()));
                         broadcast(
                             &peers,
                             &me,
@@ -217,6 +310,45 @@ fn main() {
                     if count > 2 * f && !state.decided {
                         state.decided = true;
                         eprintln!("DECIDED on message: {}", m);
+                    }
+                }
+                Message::ViewChange {
+                    from,
+                    newview: nv,
+                    prepared,
+                } => {
+                    let mut state = state.lock().unwrap();
+                    let entry = state
+                        .viewchanges
+                        .entry(from)
+                        .or_insert((nv, prepared.clone()));
+                    if nv > entry.0 {
+                        *entry = (nv, prepared);
+                    }
+
+                    let count = state.viewchanges.values().filter(|(v, _)| *v == nv).count();
+                    if count >= f + 1 && !state.sent_viewchange && nv > state.view {
+                        state.sent_viewchange = true;
+                        broadcast(
+                            &peers,
+                            &me,
+                            &Message::ViewChange {
+                                from: me.clone(),
+                                newview: nv,
+                                prepared: state.prepared.clone(),
+                            },
+                        );
+                    }
+                    if count > 2 * f && nv > state.view {
+                        state.view = nv;
+                        state.sent_viewchange = false;
+                        state.prepares.clear();
+                        state.commits.clear();
+                        state.preprepared = false;
+                        state.sentcommit = false;
+                        state.view_entered = Instant::now();
+                        eprintln!("ENTERED VIEW {}", nv);
+                        leader = leader_of(nv, &nodes);
                     }
                 }
             }
