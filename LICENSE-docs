@@ -1,0 +1,22 @@
+Creative Commons Attribution 4.0 International (CC BY 4.0)
+
+Copyright (c) 2026 Luca Zanolini
+
+The documentation in this repository — the module notes (every `README.md`),
+the cross-module lecture notes (`CONSENSUS.md`, `CONSISTENCY_AND_CONCURRENCY.md`),
+and the accompanying diagrams and exercises — is licensed under the Creative
+Commons Attribution 4.0 International License.
+
+You are free to share and adapt this material for any purpose, including
+commercially, provided you give appropriate credit to the author
+(Luca Zanolini, https://github.com/luca-zanolini/distributed-systems-in-rust),
+provide a link to the license, and indicate if changes were made.
+
+The source code in this repository is licensed separately under the MIT
+License; see the LICENSE file.
+
+To view a copy of the CC BY 4.0 license, visit:
+https://creativecommons.org/licenses/by/4.0/
+
+Full legal text:
+https://creativecommons.org/licenses/by/4.0/legalcode

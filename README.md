@@ -87,6 +87,16 @@ are suitable as homework.
 Build any implemented module with `cargo build` in its directory; the demos require only
 Python 3 and the compiled binary.
 
+## License
+
+This repository is dual-licensed:
+
+- **Code** (everything under each module's `src/` and `demos/`) — [MIT License](LICENSE).
+- **Documentation** (module notes, the cross-module lecture notes, diagrams, exercises) —
+  [Creative Commons Attribution 4.0 International (CC BY 4.0)](LICENSE-docs): you may reuse
+  and adapt the teaching material, provided you credit the author and link back to this
+  repository.
+
 ## Author
 
 **Luca Zanolini**
