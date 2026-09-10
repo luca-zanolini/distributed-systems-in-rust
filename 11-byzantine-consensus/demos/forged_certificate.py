@@ -1,25 +1,24 @@
-"""The attack that motivates signatures: one forged VIEWCHANGE poisons the
-view change, and four correct nodes unanimously decide a value NOBODY proposed.
+"""The forgery, replayed against Milestone 5's signed certificates: it bounces.
 
-Our VIEWCHANGE carries a bare CLAIM of a prepare certificate — `(view, value)`
-with no evidence — and the sender identity is a self-declared string. This
-script exploits both gaps at once: a raw socket (not a node at all) injects
+Before M5, a VIEWCHANGE carried a bare CLAIM of a prepared value, and this same
+injection made all four nodes decide 'evil' — a value nobody proposed. Now a
+certificate is the evidence itself: 2f+1 signatures over the canonical statement
+`PREPARE:{view}:{value}`, verified against the trusted-setup public keys before
+the selection rule may believe it.
 
-    VIEWCHANGE 127.0.0.1:7002 1 0 evil
+The attacker here does its best: a syntactically perfect JSON ViewChange,
+impersonating 7002, whose certificate exercises every defense branch at once —
+a duplicate signer, an unknown signer, malformed hex, and well-formed-but-invalid
+signatures. Expected outcome: the new leader logs one rejection per bad
+signature, finds no verifiable prepared value, and awaits a fresh proposal.
+Nobody ever decides 'evil'.
 
-into every node: an impersonation of 7002 claiming a certificate for value
-'evil' in view 0 that never existed. When the real timers fire and view 1 is
-entered, the new leader's (correct!) max-prepared-view selection adopts the
-forged claim and re-proposes 'evil'; the (correct!) quorum machinery then
-amplifies the lie into a unanimous decision. Even the impersonated 7002
-decides it — its genuine VIEWCHANGE arrived after the forgery and lost
-first-testimony-wins.
-
-Strong validity (CCGR Module 5.11, BC2) is violated on screen. Real PBFT
-closes the gap by making the view-change message carry the certificate itself
-— 2f+1 SIGNED prepares — so the leader verifies instead of believes. That is
-Milestone 5."""
-import socket, time
+Remaining honest gap (documented in the README): the ViewChange ENVELOPE is
+still unsigned — the forged message does occupy 7002's slot in the view-change
+tally (identity is only as strong as the channel). What it can no longer do is
+smuggle a VALUE into the protocol: values now travel only inside verifiable
+certificates."""
+import json, socket, time
 import common as c
 
 procs = c.launch()
@@ -27,32 +26,52 @@ print(">> BYZANTINE leader 7000 equivocates — view 0 wedges, nobody prepares a
 c.drive(procs, "7000", "bcast equiv attack retreat")
 time.sleep(1.0)
 
-forged = "VIEWCHANGE 127.0.0.1:7002 1 0 evil\n"
-print(f">> INJECTING forged message into every node: {forged.strip()!r}")
-print("   (sent by a raw Python socket impersonating 7002 — no such certificate")
-print("    was ever formed; 'evil' has never been proposed by any process)")
+zeros = "00" * 64   # valid hex, valid length, invalid signature
+forged = json.dumps({
+    "ViewChange": {
+        "from": "127.0.0.1:7002",
+        "newview": 1,
+        "prepared": {
+            "view": 0,
+            "value": "evil",
+            "sigs": [
+                ["127.0.0.1:7000", zeros],      # known signer, garbage signature
+                ["127.0.0.1:7000", zeros],      # duplicate signer
+                ["127.0.0.1:9999", zeros],      # unknown signer
+                ["127.0.0.1:7002", "zz"],       # malformed hex
+                ["127.0.0.1:7003", zeros],      # known signer, garbage signature
+            ],
+        },
+    }
+}) + "\n"
+print(">> INJECTING a well-formed forged ViewChange (impersonating 7002) claiming a")
+print("   certificate for (view 0, 'evil') — 5 signatures, all of them lies")
 for p in c.ALL:
     s = socket.create_connection(("127.0.0.1", int(p)))
     s.sendall(forged.encode())
     s.close()
 
-print(">> waiting out the timeout: view 1 is entered, the leader consults the claims ...")
+print(">> waiting out the timeout: view 1 is entered, the leader checks the evidence ...")
 logs = c.collect(procs, settle=7.0)
 c.report(logs, faulty={"7000"})
 
-adopted = any("adopting prepared value" in l for l in logs["7001"])
+leader_log = logs["7001"]
+rejects = [l for l in leader_log if l.startswith("cert:")]
+fresh = any("no prepared value" in l for l in leader_log)
 ok, vals = c.verdict_agreement(logs, faulty={"7000"})
-if vals == {"evil"}:
-    print("\n   VERDICT: POISONED — the cluster unanimously decided 'evil', a value no")
-    print("   process ever proposed, planted by one 35-byte forged message."
-          + (" The leader" if adopted else ""))
-    if adopted:
-        print("   dutifully 'adopted the prepared value from view 0' — every correct")
-        print("   mechanism (selection rule, quorums) worked exactly as designed and")
-        print("   faithfully amplified the lie.")
-    print("   Moral: the view change makes the leader TRUST a certificate, so the")
-    print("   certificate must be UNFORGEABLE (2f+1 signed prepares) — or the trust")
-    print("   is a weapon. First-hand votes need no signatures; forwarded evidence")
-    print("   (hearsay) does. This is Milestone 5's reason to exist.")
+print(f"\n   leader 7001's verification log ({len(rejects)} rejection lines):")
+for l in rejects:
+    print(f"      {l}")
+
+if "evil" not in vals and rejects and fresh:
+    print("\n   VERDICT: FORGERY BOUNCED — every signature in the forged certificate was")
+    print("   rejected (duplicate / unknown / malformed / invalid), the selection rule")
+    print("   found no verifiable prepared value, and 'evil' was never proposed, let")
+    print("   alone decided. The same injection that poisoned the unauthenticated")
+    print("   protocol now dies at the verify_cert boundary: certificates are evidence,")
+    print("   not claims — hearsay made checkable by 2f+1 signatures.")
+elif "evil" in vals:
+    print("\n   VERDICT: POISONED — 'evil' was decided; verification failed to protect.")
 else:
-    print(f"\n   VERDICT: UNEXPECTED — decided values: {vals or 'none'}")
+    print(f"\n   VERDICT: UNEXPECTED — decided={vals or 'none'}, "
+          f"rejections={len(rejects)}, fresh-proposal log={'yes' if fresh else 'no'}")

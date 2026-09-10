@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -13,6 +15,18 @@ fn port_of(addr: &str) -> u16 {
         .unwrap_or(u16::MAX)
 }
 
+/// A prepare certificate: the evidence that a quorum prepared `value` in `view`.
+/// `sigs` holds (signer address, hex signature) pairs — each signature is over the
+/// canonical statement for (view, value). With `sigs` verified, this object is
+/// transferable proof; with `sigs` empty or unchecked, it is hearsay.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Cert {
+    view: u64,
+    value: String,
+    sigs: Vec<(String, String)>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 enum Message {
     PrePrepare {
         from: String,
@@ -23,6 +37,7 @@ enum Message {
         from: String,
         view: u64,
         m: String,
+        sig: String,
     },
     Commit {
         from: String,
@@ -32,91 +47,109 @@ enum Message {
     ViewChange {
         from: String,
         newview: u64,
-        prepared: Option<(u64, String)>,
+        prepared: Option<Cert>,
     },
 }
 
 fn encode(msg: &Message) -> String {
-    match msg {
-        Message::PrePrepare { from, view, m } => format!("PREPREPARE {from} {view} {m}\n"),
-        Message::Prepare { from, view, m } => format!("PREPARE {from} {view} {m}\n"),
-        Message::Commit { from, view, m } => format!("COMMIT {from} {view} {m}\n"),
-        Message::ViewChange {
-            from,
-            newview,
-            prepared,
-        } => {
-            let prepared_str = if let Some((v, m)) = prepared {
-                format!("{v} {m}")
-            } else {
-                "-".to_string()
-            };
-            format!("VIEWCHANGE {from} {newview} {prepared_str}\n")
-        }
-    }
+    let mut s = serde_json::to_string(msg).expect("message serializes");
+    s.push('\n');
+    s
+}
+
+fn decode(s: &str) -> Option<Message> {
+    serde_json::from_str(s.trim()).ok()
 }
 
 struct State {
     view: u64,
-    viewchanges: HashMap<String, (u64, Option<(u64, String)>)>, //(per sender: the view they want, the certificate they claim);
+    viewchanges: HashMap<String, (u64, Option<Cert>)>, // per sender: the view they want, the certificate they present
     sentcommit: bool,
     decided: bool,
     preprepared: bool,
-    prepared: Option<(u64, String)>,
-    prepares: HashMap<String, String>,
+    prepared: Option<Cert>,
+    prepares: HashMap<String, (String, String)>, // per sender: (value, hex signature over the statement)
     commits: HashMap<String, String>,
     sent_viewchange: bool,
     view_entered: Instant,
 }
 
-fn decode(s: &str) -> Option<Message> {
-    let (kind, value) = s.trim().split_once(' ')?;
-
-    match kind {
-        "PREPREPARE" => {
-            let (from, rest) = value.split_once(' ')?;
-            let (view, m) = rest.split_once(' ')?;
-            Some(Message::PrePrepare {
-                from: from.to_string(),
-                view: view.parse().ok()?,
-                m: m.to_string(),
-            })
-        }
-        "PREPARE" => {
-            let (from, rest) = value.split_once(' ')?;
-            let (view, m) = rest.split_once(' ')?;
-            Some(Message::Prepare {
-                from: from.to_string(),
-                view: view.parse().ok()?,
-                m: m.to_string(),
-            })
-        }
-        "COMMIT" => {
-            let (from, rest) = value.split_once(' ')?;
-            let (view, m) = rest.split_once(' ')?;
-            Some(Message::Commit {
-                from: from.to_string(),
-                view: view.parse().ok()?,
-                m: m.to_string(),
-            })
-        }
-        "VIEWCHANGE" => {
-            let (from, rest) = value.split_once(' ')?;
-            let (newview, prepared_str) = rest.split_once(' ')?;
-            let prepared = if prepared_str == "-" {
-                None
-            } else {
-                let (v, m) = prepared_str.split_once(' ')?;
-                Some((v.parse().ok()?, m.to_string()))
-            };
-            Some(Message::ViewChange {
-                from: from.to_string(),
-                newview: newview.parse().ok()?,
-                prepared,
-            })
-        }
-        _ => None,
+/// keygen: write a fresh ed25519 keypair per port under keys/ (hex-encoded).
+/// Distributing the public keys out of band is the trusted-setup assumption
+/// PBFT makes too; keys/ is gitignored — secrets never enter Git.
+fn keygen(ports: &[String]) {
+    std::fs::create_dir_all("keys").expect("create keys/");
+    for p in ports {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).expect("OS randomness");
+        let sk = SigningKey::from_bytes(&seed);
+        std::fs::write(format!("keys/{p}.sk"), hex::encode(sk.to_bytes())).unwrap();
+        std::fs::write(
+            format!("keys/{p}.pk"),
+            hex::encode(sk.verifying_key().to_bytes()),
+        )
+        .unwrap();
+        eprintln!("wrote keys/{p}.sk and keys/{p}.pk");
     }
+}
+
+/// Load this node's signing key and every node's verifying key from keys/.
+fn load_keys(port: &str, nodes: &[String]) -> (SigningKey, HashMap<String, VerifyingKey>) {
+    let read = |path: String| -> [u8; 32] {
+        let hex_str = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("{path} missing — run: cargo run -- keygen <ports...>"));
+        hex::decode(hex_str.trim())
+            .expect("valid hex")
+            .try_into()
+            .expect("32 bytes")
+    };
+    let sk = SigningKey::from_bytes(&read(format!("keys/{port}.sk")));
+    let mut pks = HashMap::new();
+    for addr in nodes {
+        let p = port_of(addr);
+        let pk = VerifyingKey::from_bytes(&read(format!("keys/{p}.pk"))).expect("valid pubkey");
+        pks.insert(addr.clone(), pk);
+    }
+    (sk, pks)
+}
+
+fn verify_cert(cert: &Cert, pks: &HashMap<String, VerifyingKey>, n: usize, f: usize) -> bool {
+    let mut seen = HashSet::new();
+    let mut valid_sigs: usize = 0;
+    for (from, sig) in &cert.sigs {
+        if !seen.insert(from) {
+            eprintln!("cert: duplicate signer {from} — not counted twice");
+            continue;
+        }
+        let Some(pk) = pks.get(from) else {
+            eprintln!("cert: unknown signer {from} — not counted");
+            continue;
+        };
+        let Ok(bytes) = hex::decode(sig) else {
+            eprintln!("cert: malformed signature from {from} — not counted");
+            continue;
+        };
+        let Ok(sig_obj) = Signature::try_from(bytes.as_slice()) else {
+            eprintln!("cert: malformed signature from {from} — not counted");
+            continue;
+        };
+        if pk
+            .verify(
+                prepare_statement(cert.view, &cert.value).as_bytes(),
+                &sig_obj,
+            )
+            .is_ok()
+        {
+            valid_sigs += 1;
+        } else {
+            eprintln!("cert: INVALID signature from {from} — not counted");
+        }
+    }
+    2 * valid_sigs > n + f
+}
+
+fn prepare_statement(view: u64, m: &str) -> String {
+    format!("PREPARE:{}:{}", view, m)
 }
 
 fn send_to(targets: &[String], message: &Message) {
@@ -145,6 +178,11 @@ fn broadcast(peers: &[String], me: &str, message: &Message) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    if args.get(1).map(String::as_str) == Some("keygen") {
+        keygen(&args[2..]);
+        return;
+    }
+
     let port = args.get(1).cloned().unwrap_or_else(|| "6000".to_string());
     let me = format!("127.0.0.1:{port}");
     let peers: Vec<String> = args
@@ -158,6 +196,8 @@ fn main() {
         .chain(peers.iter().cloned())
         .collect();
     nodes.sort_by_key(|a| port_of(a));
+
+    let (sk, pks) = load_keys(&port, &nodes);
 
     let state: Arc<Mutex<State>> = Arc::new(Mutex::new(State {
         view: 0,
@@ -259,7 +299,7 @@ fn main() {
                         &Message::ViewChange {
                             from: me.clone(),
                             newview: nv,
-                            prepared: prepared,
+                            prepared,
                         },
                     );
                 }
@@ -284,6 +324,7 @@ fn main() {
                         && !state.preprepared
                     {
                         state.preprepared = true;
+                        let stmt = prepare_statement(v, &m);
                         broadcast(
                             &peers,
                             &me,
@@ -291,17 +332,50 @@ fn main() {
                                 from: me.clone(),
                                 view: v,
                                 m: m.clone(),
+                                sig: hex::encode(sk.sign(stmt.as_bytes()).to_bytes()),
                             },
                         );
                     }
                 }
-                Message::Prepare { from, view: v, m } => {
+                Message::Prepare {
+                    from,
+                    view: v,
+                    m,
+                    sig,
+                } => {
                     let mut state = state.lock().unwrap();
-                    state.prepares.entry(from).or_insert(m.clone());
-                    let count = state.prepares.values().filter(|v| **v == m).count();
+                    let stmt = prepare_statement(v, &m);
+                    let Some(pk) = pks.get(&from) else {
+                        eprintln!("DROPPED PREPARE from unknown sender {from}");
+                        continue;
+                    };
+                    let Ok(bytes) = hex::decode(&sig) else {
+                        eprintln!("DROPPED PREPARE with malformed signature from {from}");
+                        continue;
+                    };
+                    let Ok(sig_obj) = Signature::try_from(bytes.as_slice()) else {
+                        eprintln!("DROPPED PREPARE with malformed signature from {from}");
+                        continue;
+                    };
+                    if pk.verify(stmt.as_bytes(), &sig_obj).is_err() {
+                        eprintln!("DROPPED PREPARE with invalid signature claiming from {from}");
+                        continue;
+                    }
+                    state.prepares.entry(from).or_insert((m.clone(), sig));
+                    let count = state.prepares.values().filter(|(val, _)| *val == m).count();
                     if 2 * count > n + f && !state.sentcommit && v == state.view {
                         state.sentcommit = true;
-                        state.prepared = Some((v, m.clone()));
+                        let cert_sigs: Vec<(String, String)> = state
+                            .prepares
+                            .iter()
+                            .filter(|(_, (val, _))| *val == m)
+                            .map(|(from, (_, sig))| (from.clone(), sig.clone()))
+                            .collect();
+                        state.prepared = Some(Cert {
+                            view: v,
+                            value: m.clone(),
+                            sigs: cert_sigs,
+                        });
                         broadcast(
                             &peers,
                             &me,
@@ -359,22 +433,29 @@ fn main() {
                         state.view_entered = Instant::now();
                         eprintln!("ENTERED VIEW {}", nv);
                         if leader_of(nv, &nodes) == me {
-                            let mut max_prepared: Option<(u64, String)> = None;
+                            let mut max_prepared: Option<Cert> = None;
                             for (_from, (v, prepared)) in &state.viewchanges {
                                 if *v == nv {
-                                    if let Some((pv, val)) = prepared {
+                                    if let Some(cert) = prepared {
+                                        if !verify_cert(cert, &pks, n, f) {
+                                            eprintln!(
+                                                "Invalid certificate from view {}",
+                                                cert.view
+                                            );
+                                            continue;
+                                        }
                                         if max_prepared.is_none()
-                                            || pv > &max_prepared.as_ref().unwrap().0
+                                            || cert.view > max_prepared.as_ref().unwrap().view
                                         {
-                                            max_prepared = Some((*pv, val.clone()));
+                                            max_prepared = Some(cert.clone());
                                         }
                                     }
                                 }
                             }
-                            if let Some((pv, val)) = max_prepared {
+                            if let Some(cert) = max_prepared {
                                 eprintln!(
                                     "Leader {} adopting prepared value from view {}: {}",
-                                    me, pv, val
+                                    me, cert.view, cert.value
                                 );
                                 broadcast(
                                     &peers,
@@ -382,7 +463,7 @@ fn main() {
                                     &Message::PrePrepare {
                                         from: me.clone(),
                                         view: nv,
-                                        m: val,
+                                        m: cert.value,
                                     },
                                 );
                             } else {
@@ -393,7 +474,7 @@ fn main() {
                 }
             }
         } else {
-            eprintln!("Received unknown message: {}", line);
+            eprintln!("Received unknown message: {}", line.trim());
         }
     }
 }

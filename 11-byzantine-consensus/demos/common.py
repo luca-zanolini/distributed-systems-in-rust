@@ -21,12 +21,20 @@ def peers_of(port):
     return [addr(q) for q in ALL if q != port]
 
 
+def keygen():
+    """Generate the trusted-setup keys (keys/<port>.sk/.pk) in the crate dir."""
+    subprocess.run([BIN, "keygen", *ALL], cwd=CRATE, check=True,
+                   capture_output=True)
+
+
 def launch(ports=ALL):
     """Start the given nodes; return {port: Popen}. Nodes not listed are 'down'."""
+    keygen()
     procs = {}
     for p in ports:
         procs[p] = subprocess.Popen(
             [BIN, p, *peers_of(p)],
+            cwd=CRATE,   # nodes read keys/ relative to the crate dir
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True,
         )
