@@ -32,6 +32,7 @@ enum Message {
         from: String,
         view: u64,
         m: String,
+        sig: String,
     },
     Prepare {
         from: String,
@@ -43,22 +44,76 @@ enum Message {
         from: String,
         view: u64,
         m: String,
+        sig: String,
     },
     ViewChange {
         from: String,
         newview: u64,
         prepared: Option<Cert>,
+        sig: String,
     },
 }
 
-fn encode(msg: &Message) -> String {
-    let mut s = serde_json::to_string(msg).expect("message serializes");
+/// The canonical, domain-separated statement an envelope signature covers.
+/// For Prepare it is exactly the certificate statement: a Prepare's envelope
+/// signature IS its certificate signature (self-contained, hence forwardable).
+/// For ViewChange the statement covers the serialized certificate claim, so a
+/// relayed/tampered claim breaks the envelope.
+fn statement(msg: &Message) -> String {
+    match msg {
+        Message::PrePrepare { view, m, .. } => format!("PREPREPARE:{}:{}", view, m),
+        Message::Prepare { view, m, .. } => prepare_statement(*view, m),
+        Message::Commit { view, m, .. } => format!("COMMIT:{}:{}", view, m),
+        Message::ViewChange {
+            newview, prepared, ..
+        } => format!(
+            "VIEWCHANGE:{}:{}",
+            newview,
+            serde_json::to_string(prepared).expect("claim serializes")
+        ),
+    }
+}
+
+/// Send-side of the authentication layer: fill in our signature over the
+/// canonical statement, then encode for the wire.
+fn seal(msg: &Message, sk: &SigningKey) -> String {
+    let signature = hex::encode(sk.sign(statement(msg).as_bytes()).to_bytes());
+    let mut sealed = msg.clone();
+    match &mut sealed {
+        Message::PrePrepare { sig, .. }
+        | Message::Prepare { sig, .. }
+        | Message::Commit { sig, .. }
+        | Message::ViewChange { sig, .. } => *sig = signature,
+    }
+    let mut s = serde_json::to_string(&sealed).expect("message serializes");
     s.push('\n');
     s
 }
 
 fn decode(s: &str) -> Option<Message> {
     serde_json::from_str(s.trim()).ok()
+}
+
+/// Receive-side of the authentication layer: true iff the envelope signature
+/// verifies against the KNOWN key of the claimed sender over the canonical
+/// statement. Soft-fail on every hostile shape — malformed is malicious.
+fn verify_envelope(msg: &Message, pks: &HashMap<String, VerifyingKey>) -> bool {
+    let (from, sig) = match msg {
+        Message::PrePrepare { from, sig, .. }
+        | Message::Prepare { from, sig, .. }
+        | Message::Commit { from, sig, .. }
+        | Message::ViewChange { from, sig, .. } => (from, sig),
+    };
+    let Some(pk) = pks.get(from) else {
+        return false;
+    };
+    let Ok(bytes) = hex::decode(sig) else {
+        return false;
+    };
+    let Ok(sig_obj) = Signature::try_from(bytes.as_slice()) else {
+        return false;
+    };
+    pk.verify(statement(msg).as_bytes(), &sig_obj).is_ok()
 }
 
 struct State {
@@ -153,13 +208,13 @@ fn prepare_statement(view: u64, m: &str) -> String {
     format!("PREPARE:{}:{}", view, m)
 }
 
-fn send_to(targets: &[String], message: &Message) {
-    let msg = encode(message);
+fn send_to(targets: &[String], message: &Message, sk: &SigningKey) {
+    let line = seal(message, sk);
     for target in targets.iter().cloned() {
-        let msg = msg.clone();
+        let line = line.clone();
         std::thread::spawn(move || {
             if let Ok(mut stream) = TcpStream::connect(&target) {
-                let _ = stream.write_all(msg.as_bytes());
+                let _ = stream.write_all(line.as_bytes());
             }
         });
     }
@@ -170,10 +225,10 @@ fn leader_of(view: u64, nodes: &[String]) -> String {
     nodes[index].clone()
 }
 
-fn broadcast(peers: &[String], me: &str, message: &Message) {
+fn broadcast(peers: &[String], me: &str, message: &Message, sk: &SigningKey) {
     let mut targets: Vec<String> = peers.iter().cloned().collect();
     targets.push(me.to_string());
-    send_to(&targets, message);
+    send_to(&targets, message, sk);
 }
 
 #[derive(Serialize, Deserialize)]
@@ -241,13 +296,13 @@ fn main() {
     let my_prepare = disk.as_ref().and_then(|p| p.my_prepare.clone());
     let preprepared = my_prepare.as_ref().is_some_and(|(v, _)| *v == view);
 
-    let mut initial = State {
-        view: view,
+    let initial = State {
+        view,
         viewchanges: HashMap::new(),
         sentcommit: false,
         decided: disk.as_ref().and_then(|p| p.decided.clone()),
-        preprepared: preprepared,
-        my_prepare: my_prepare,
+        preprepared,
+        my_prepare,
         prepared: disk.as_ref().and_then(|p| p.prepared.clone()),
         prepares: HashMap::new(),
         commits: HashMap::new(),
@@ -262,6 +317,7 @@ fn main() {
         let peers = peers.clone();
         let state = Arc::clone(&state);
         let nodes = nodes.clone();
+        let sk = sk.clone();
         thread::spawn(move || {
             for line in std::io::stdin().lock().lines() {
                 let Ok(line) = line else { break };
@@ -282,7 +338,9 @@ fn main() {
                                     from: me.clone(),
                                     view,
                                     m: m.to_string(),
+                                    sig: String::new(),
                                 },
+                                &sk,
                             );
                         } else {
                             eprintln!("Not the leader, cannot propose: {m}");
@@ -298,7 +356,9 @@ fn main() {
                                 from: me.clone(),
                                 view: 0,
                                 m: m.to_string(),
+                                sig: String::new(),
                             },
+                            &sk,
                         );
                         send_to(
                             &peers[half..],
@@ -306,7 +366,37 @@ fn main() {
                                 from: me.clone(),
                                 view: 0,
                                 m: n.to_string(),
+                                sig: String::new(),
                             },
+                            &sk,
+                        );
+                    }
+
+                    // Byzantine INSIDER attack: broadcast a view-change claiming a
+                    // prepare certificate that was never formed (garbage inner
+                    // signatures) — but inside a perfectly valid, signed envelope.
+                    // The envelope gate cannot catch this; only verify_cert can.
+                    ["fakecert", m] => {
+                        let nv = state.lock().unwrap().view + 1;
+                        let fake = Cert {
+                            view: nv - 1,
+                            value: m.to_string(),
+                            sigs: nodes
+                                .iter()
+                                .map(|a| (a.clone(), "00".repeat(64)))
+                                .collect(),
+                        };
+                        eprintln!("INSIDER: claiming forged certificate for '{m}' in my VIEWCHANGE");
+                        broadcast(
+                            &peers,
+                            &me,
+                            &Message::ViewChange {
+                                from: me.clone(),
+                                newview: nv,
+                                prepared: Some(fake),
+                                sig: String::new(),
+                            },
+                            &sk,
                         );
                     }
                     _ => {
@@ -320,12 +410,14 @@ fn main() {
         let me = me.clone();
         let peers = peers.clone();
         let state = Arc::clone(&state);
+        let sk = sk.clone();
         thread::spawn(move || loop {
             let timeout = Duration::from_secs(4);
             thread::sleep(Duration::from_millis(500));
             let fire = {
                 let mut s = state.lock().unwrap();
-                if s.decided.is_none() && !s.sent_viewchange && s.view_entered.elapsed() > timeout {
+                if s.decided.is_none() && !s.sent_viewchange && s.view_entered.elapsed() > timeout
+                {
                     s.sent_viewchange = true;
                     Some((s.view + 1, s.prepared.clone()))
                 } else {
@@ -340,7 +432,9 @@ fn main() {
                         from: me.clone(),
                         newview: nv,
                         prepared,
+                        sig: String::new(),
                     },
+                    &sk,
                 );
             }
         });
@@ -355,17 +449,28 @@ fn main() {
             continue;
         }
         if let Some(msg) = decode(&line) {
+            // The authentication gate: one check protecting every arm below.
+            // Past this line, `from` fields are trustworthy identities.
+            if !verify_envelope(&msg, &pks) {
+                let from = match &msg {
+                    Message::PrePrepare { from, .. }
+                    | Message::Prepare { from, .. }
+                    | Message::Commit { from, .. }
+                    | Message::ViewChange { from, .. } => from,
+                };
+                eprintln!("DROPPED unauthenticated message claiming from {from}");
+                continue;
+            }
             match msg {
-                Message::PrePrepare { from, view: v, m } => {
+                Message::PrePrepare {
+                    from, view: v, m, ..
+                } => {
                     let mut state = state.lock().unwrap();
-                    if from == leader_of(state.view, &nodes)
-                        && v == state.view
-                        && !state.preprepared
+                    if from == leader_of(state.view, &nodes) && v == state.view && !state.preprepared
                     {
                         state.preprepared = true;
                         state.my_prepare = Some((v, m.clone()));
                         persist(&state, &state_path);
-                        let stmt = prepare_statement(v, &m);
                         broadcast(
                             &peers,
                             &me,
@@ -373,8 +478,9 @@ fn main() {
                                 from: me.clone(),
                                 view: v,
                                 m: m.clone(),
-                                sig: hex::encode(sk.sign(stmt.as_bytes()).to_bytes()),
+                                sig: String::new(),
                             },
+                            &sk,
                         );
                     }
                 }
@@ -384,24 +490,10 @@ fn main() {
                     m,
                     sig,
                 } => {
+                    // Envelope already verified at the gate — and for Prepare the
+                    // envelope statement IS the certificate statement, so `sig` is
+                    // certificate-grade evidence, safe to store in the tally.
                     let mut state = state.lock().unwrap();
-                    let stmt = prepare_statement(v, &m);
-                    let Some(pk) = pks.get(&from) else {
-                        eprintln!("DROPPED PREPARE from unknown sender {from}");
-                        continue;
-                    };
-                    let Ok(bytes) = hex::decode(&sig) else {
-                        eprintln!("DROPPED PREPARE with malformed signature from {from}");
-                        continue;
-                    };
-                    let Ok(sig_obj) = Signature::try_from(bytes.as_slice()) else {
-                        eprintln!("DROPPED PREPARE with malformed signature from {from}");
-                        continue;
-                    };
-                    if pk.verify(stmt.as_bytes(), &sig_obj).is_err() {
-                        eprintln!("DROPPED PREPARE with invalid signature claiming from {from}");
-                        continue;
-                    }
                     state.prepares.entry(from).or_insert((m.clone(), sig));
                     let count = state.prepares.values().filter(|(val, _)| *val == m).count();
                     if 2 * count > n + f && !state.sentcommit && v == state.view {
@@ -425,11 +517,15 @@ fn main() {
                                 from: me.clone(),
                                 view: v,
                                 m: m.clone(),
+                                sig: String::new(),
                             },
+                            &sk,
                         );
                     }
                 }
-                Message::Commit { from, view: v, m } => {
+                Message::Commit {
+                    from, view: v, m, ..
+                } => {
                     let mut state = state.lock().unwrap();
                     state.commits.entry(from).or_insert(m.clone());
                     let count = state.commits.values().filter(|v| **v == m).count();
@@ -443,6 +539,7 @@ fn main() {
                     from,
                     newview: nv,
                     prepared,
+                    ..
                 } => {
                     let mut state = state.lock().unwrap();
                     let entry = state
@@ -463,7 +560,9 @@ fn main() {
                                 from: me.clone(),
                                 newview: nv,
                                 prepared: state.prepared.clone(),
+                                sig: String::new(),
                             },
+                            &sk,
                         );
                     }
                     if count > 2 * f && nv > state.view {
@@ -482,10 +581,7 @@ fn main() {
                                 if *v == nv {
                                     if let Some(cert) = prepared {
                                         if !verify_cert(cert, &pks, n, f) {
-                                            eprintln!(
-                                                "Invalid certificate from view {}",
-                                                cert.view
-                                            );
+                                            eprintln!("Invalid certificate from view {}", cert.view);
                                             continue;
                                         }
                                         if max_prepared.is_none()
@@ -508,7 +604,9 @@ fn main() {
                                         from: me.clone(),
                                         view: nv,
                                         m: cert.value,
+                                        sig: String::new(),
                                     },
+                                    &sk,
                                 );
                             } else {
                                 eprintln!("VIEW {nv}: no prepared value — awaiting fresh proposal");
