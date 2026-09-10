@@ -126,7 +126,7 @@ struct State {
     prepared: Option<Cert>,
     prepares: HashMap<String, (String, String)>, // per sender: (value, hex signature over the statement)
     commits: HashMap<String, String>,
-    sent_viewchange: bool,
+    highest_vc_sent: u64, // the highest view I have complained toward
     view_entered: Instant,
 }
 
@@ -306,7 +306,7 @@ fn main() {
         prepared: disk.as_ref().and_then(|p| p.prepared.clone()),
         prepares: HashMap::new(),
         commits: HashMap::new(),
-        sent_viewchange: false,
+        highest_vc_sent: 0, 
         view_entered: Instant::now(),
     };
 
@@ -416,10 +416,12 @@ fn main() {
             thread::sleep(Duration::from_millis(500));
             let fire = {
                 let mut s = state.lock().unwrap();
-                if s.decided.is_none() && !s.sent_viewchange && s.view_entered.elapsed() > timeout
+                if s.decided.is_none() && s.view_entered.elapsed() > timeout
                 {
-                    s.sent_viewchange = true;
-                    Some((s.view + 1, s.prepared.clone()))
+                    let target = s.view.max(s.highest_vc_sent) + 1;
+                    s.highest_vc_sent = target;
+                    s.view_entered = Instant::now();
+                    Some((target, s.prepared.clone()))
                 } else {
                     None
                 }
@@ -551,8 +553,8 @@ fn main() {
                     }
 
                     let count = state.viewchanges.values().filter(|(v, _)| *v == nv).count();
-                    if count >= f + 1 && !state.sent_viewchange && nv > state.view {
-                        state.sent_viewchange = true;
+                    if count >= f + 1 && nv > state.highest_vc_sent && nv > state.view {
+                        state.highest_vc_sent = nv;
                         broadcast(
                             &peers,
                             &me,
@@ -567,7 +569,6 @@ fn main() {
                     }
                     if count > 2 * f && nv > state.view {
                         state.view = nv;
-                        state.sent_viewchange = false;
                         state.prepares.clear();
                         state.commits.clear();
                         state.preprepared = false;
