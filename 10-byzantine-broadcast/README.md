@@ -323,10 +323,13 @@ protocols pay quadratic communication to keep all evidence first-hand. PBFT and 
 
 - **Processes.** `N = 4` nodes, `f = 1`; the designated sender is fixed by the `--sender`
   argument given identically to all nodes (a-priori agreement on `s`).
-- **Links.** TCP; the **authenticated perfect links** abstraction (CCGR §2.4.6) is *assumed*:
-  the self-declared `from` field of a message is trusted. In production the assumption is
-  discharged by MACs or TLS (the book notes TLS provides it with encryption disabled); here it
-  is discharged by scripting the adversary to lie only in its own name. See §9.
+- **Links.** TCP, with the **authenticated perfect links** abstraction (CCGR §2.4.6)
+  *implemented*, not merely assumed: every message carries an ed25519 signature over a
+  domain-separated statement of its content, verified against the claimed sender's known public
+  key at a single gate before any protocol logic runs. A message that fails the gate is dropped
+  and logged. Key distribution is a trusted setup (a `keygen` step writes `keys/<port>.sk/.pk`;
+  all nodes know all public keys) — the explicit anti-Sybil assumption under which "at most `f`
+  Byzantine" is meaningful. See §6.5 for why signatures here are strictly a *link-layer* choice.
 - **Timing.** Asynchronous — no timeouts anywhere in the protocol. Byzantine *reliable
   broadcast* is solvable in the asynchronous model (no conflict with FLP: with a faulty sender
   the primitive may legitimately deliver nothing, so no decision is *forced*); Byzantine
@@ -335,6 +338,57 @@ protocols pay quadratic communication to keep all evidence first-hand. PBFT and 
   rather than fixed at spawn time: being Byzantine is a *capability*, and whether it is
   exercised is the adversary's choice per execution (§3). A silent (killed) node doubles as the
   mildest Byzantine node.
+
+## 6.5 The authentication layer: MACs vs signatures
+
+The abstraction the proofs stand on — *if a correct process delivers a message attributed to a
+correct sender, that sender sent it* — can be discharged by two different primitives, and the
+choice is more instructive than it first appears.
+
+**A MAC is spoken testimony; a signature is a notarized affidavit.** A MAC is computed with a
+key the two endpoints *share*: the receiver is certain of the sender precisely because it knows
+it did not forge the tag itself — which is also exactly why it can convince *nobody else*.
+Knowledge authenticated by MACs is real but stuck inside its recipient (**non-transferable**).
+A signature is verifiable by anyone holding the public key, no matter how many hands the
+message passed through: knowledge made **portable**.
+
+Bracha's algorithm needs only the testimony grade. Every message is **first-hand** — an ECHO
+says "the sender showed *me* this value," a READY says "*I* saw a quorum" — and no process ever
+forwards another's message. That is why the protocol is signature-free *in principle*, and why
+its cost is `O(N²)`: **all-to-all gossip is the price of non-transferable knowledge**. When a
+protocol does exploit transferability, its shape changes: in *Signed Echo Broadcast*
+(CCGR Alg. 3.17) the sender collects `2f+1` signed echoes into a forwardable bundle — a
+**certificate**, knowledge made portable — and the all-to-all round disappears (`O(N)`
+messages, one certificate). Every certificate in a protocol marks a spot where transferability
+is being spent; Module 11's view change is the load-bearing example, and HotStuff is the design
+you get by spending it everywhere.
+
+This implementation uses **ed25519 signatures but only as link authentication** — each
+signature is checked by its direct recipient at the gate and never forwarded — for uniformity
+with Module 11, where the same primitive *is* used transferably. Two consequences worth
+noting:
+
+1. **The structure of Bracha is untouched by the choice.** Thresholds, tallies, amplification —
+   byte-for-byte identical with MACs, with signatures, or (as the code stood before this layer)
+   with blind trust. Authentication is a layer *below* the protocol; the arms above the gate
+   never changed. (One small code-shape difference had we used MACs: a MAC is per recipient-pair,
+   so `seal` would move inside the per-peer send loop and compute `N` tags per broadcast; a
+   signature is computed once and shipped to all.)
+2. **Signatures stop impersonation, not equivocation.** The equivocation demo behaves
+   *identically* under the authentication layer: the Byzantine sender owns its key and validly
+   signs both `SEND:attack` and `SEND:retreat`. Defeating equivocation is the *protocol's* job
+   (the echo quorum), not the crypto's. Nor does the layer change resilience: `N = 3f+1` stands
+   regardless — signatures reduce the bound (to any `f`, Dolev–Strong) only under *full*
+   synchrony, never in our asynchronous setting.
+
+Mechanics, visible in the code: a canonical, **domain-separated statement** per message
+(`SEND:{m}` / `ECHO:{m}` / `READY:{m}` — the type tag prevents an ECHO signature from being
+replayed as a READY), a `seal` function signing on the way out, and a `verify_envelope` gate on
+the way in that fails *soft* on every hostile shape — unknown sender, malformed hex, wrong
+length, invalid signature — because on a network boundary, malformed is malicious and the
+correct response is to drop, never to crash. The `demos/forged_ready.py` experiment replays the
+pre-layer attack (three impersonated READYs = a fake `2f+1` quorum, enough to make any node
+deliver an arbitrary value) and watches it die at the gate.
 
 ## 7. Development of the implementation
 
@@ -366,13 +420,15 @@ one node down (`N > 3f` at work).
 
 ## 9. Limitations and outlook
 
-- **Authenticated links are assumed, not enforced.** Anything that can open a TCP connection
-  could claim any `from`; one spoofing process could then manufacture a fake quorum and break
-  consistency single-handedly — the Sybil collapse of §3. A MAC per channel (or TLS) closes the
-  gap; this is the one trust assumption the implementation rests on, and Exercise 1 makes it
-  concrete.
-- **Signature-free by design.** Bracha buys agreement from redundancy (`O(N²)`, all first-hand)
-  rather than portable evidence; the signed column of §5.4 is deliberately left to Module 11.
+- **Authenticated links are now enforced** (§6.5): the pre-layer attack — a keyless socket
+  manufacturing a fake `2f+1` READY quorum and breaking integrity/consistency single-handedly,
+  the Sybil collapse of §3 — is reproduced and defeated in `demos/forged_ready.py`. What
+  remains assumed is the **trusted setup** (out-of-band public-key distribution): the layer
+  authenticates known identities, it cannot conjure the identity space itself.
+- **Signature-free by design — in the protocol, not the plumbing.** The signatures of §6.5 are
+  link authentication only (a MAC would serve identically); Bracha still buys agreement from
+  redundancy (`O(N²)`, all first-hand) rather than portable evidence. Transferable use of the
+  same primitive — certificates — is deliberately left to Module 11's view change.
 - **Single-shot instance.** One broadcast, one sender; a second `bcast` is correctly ignored by
   processes that already delivered (BCB2). Multi-message *Byzantine broadcast channels*
   (CCGR §3.12) tag instances with sequence numbers; a production system runs many instances
@@ -514,6 +570,7 @@ ideas of this module and its neighbors.)*
 
 ```bash
 cargo build
+cargo run -- keygen 6000 6001 6002 6003   # trusted setup: keys/<port>.sk/.pk (gitignored)
 ```
 
 Start a 4-node cluster (each node lists the other three, and the same designated sender):
