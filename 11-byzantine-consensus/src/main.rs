@@ -158,7 +158,6 @@ fn main() {
         .chain(peers.iter().cloned())
         .collect();
     nodes.sort_by_key(|a| port_of(a));
-    let mut leader = leader_of(0, &nodes);
 
     let state: Arc<Mutex<State>> = Arc::new(Mutex::new(State {
         view: 0,
@@ -179,54 +178,62 @@ fn main() {
 
     {
         let me = me.clone();
-        if leader == me {
-            let peers = peers.clone();
-            thread::spawn(move || {
-                for line in std::io::stdin().lock().lines() {
-                    let Ok(line) = line else { break };
-                    let parts: Vec<&str> = line.split_whitespace().collect();
+        let peers = peers.clone();
+        let state = Arc::clone(&state);
+        let nodes = nodes.clone();
+        thread::spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                let parts: Vec<&str> = line.split_whitespace().collect();
 
-                    match parts.as_slice() {
-                        ["bcast", m] => {
-                            eprintln!("Propose: {m}");
+                match parts.as_slice() {
+                    ["propose", m] => {
+                        let (view, i_lead) = {
+                            let s = state.lock().unwrap();
+                            (s.view, leader_of(s.view, &nodes) == me)
+                        };
+                        if i_lead {
+                            eprintln!("Proposing: {m}");
                             broadcast(
                                 &peers,
                                 &me,
                                 &Message::PrePrepare {
                                     from: me.clone(),
-                                    view: 0,
+                                    view,
                                     m: m.to_string(),
                                 },
                             );
-                        }
-
-                        ["bcast", "equiv", m, n] => {
-                            eprintln!("Equivocating: {m} / {n}");
-                            let half = peers.len() / 2;
-                            send_to(
-                                &peers[..half],
-                                &Message::PrePrepare {
-                                    from: me.clone(),
-                                    view: 0,
-                                    m: m.to_string(),
-                                },
-                            );
-                            send_to(
-                                &peers[half..],
-                                &Message::PrePrepare {
-                                    from: me.clone(),
-                                    view: 0,
-                                    m: n.to_string(),
-                                },
-                            );
-                        }
-                        _ => {
-                            eprintln!("Unknown command");
+                        } else {
+                            eprintln!("Not the leader, cannot propose: {m}");
                         }
                     }
+
+                    ["bcast", "equiv", m, n] => {
+                        eprintln!("Equivocating: {m} / {n}");
+                        let half = peers.len() / 2;
+                        send_to(
+                            &peers[..half],
+                            &Message::PrePrepare {
+                                from: me.clone(),
+                                view: 0,
+                                m: m.to_string(),
+                            },
+                        );
+                        send_to(
+                            &peers[half..],
+                            &Message::PrePrepare {
+                                from: me.clone(),
+                                view: 0,
+                                m: n.to_string(),
+                            },
+                        );
+                    }
+                    _ => {
+                        eprintln!("Unknown command");
+                    }
                 }
-            });
-        }
+            }
+        });
     }
     {
         let me = me.clone();
@@ -272,7 +279,10 @@ fn main() {
             match msg {
                 Message::PrePrepare { from, view: v, m } => {
                     let mut state = state.lock().unwrap();
-                    if from == leader && v == state.view && !state.preprepared {
+                    if from == leader_of(state.view, &nodes)
+                        && v == state.view
+                        && !state.preprepared
+                    {
                         state.preprepared = true;
                         broadcast(
                             &peers,
@@ -289,7 +299,7 @@ fn main() {
                     let mut state = state.lock().unwrap();
                     state.prepares.entry(from).or_insert(m.clone());
                     let count = state.prepares.values().filter(|v| **v == m).count();
-                    if 2 * count > n + f && !state.sentcommit {
+                    if 2 * count > n + f && !state.sentcommit && v == state.view {
                         state.sentcommit = true;
                         state.prepared = Some((v, m.clone()));
                         broadcast(
@@ -307,7 +317,7 @@ fn main() {
                     let mut state = state.lock().unwrap();
                     state.commits.entry(from).or_insert(m.clone());
                     let count = state.commits.values().filter(|v| **v == m).count();
-                    if count > 2 * f && !state.decided {
+                    if count > 2 * f && !state.decided && v == state.view {
                         state.decided = true;
                         eprintln!("DECIDED on message: {}", m);
                     }
@@ -348,7 +358,37 @@ fn main() {
                         state.sentcommit = false;
                         state.view_entered = Instant::now();
                         eprintln!("ENTERED VIEW {}", nv);
-                        leader = leader_of(nv, &nodes);
+                        if leader_of(nv, &nodes) == me {
+                            let mut max_prepared: Option<(u64, String)> = None;
+                            for (_from, (v, prepared)) in &state.viewchanges {
+                                if *v == nv {
+                                    if let Some((pv, val)) = prepared {
+                                        if max_prepared.is_none()
+                                            || pv > &max_prepared.as_ref().unwrap().0
+                                        {
+                                            max_prepared = Some((*pv, val.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some((pv, val)) = max_prepared {
+                                eprintln!(
+                                    "Leader {} adopting prepared value from view {}: {}",
+                                    me, pv, val
+                                );
+                                broadcast(
+                                    &peers,
+                                    &me,
+                                    &Message::PrePrepare {
+                                        from: me.clone(),
+                                        view: nv,
+                                        m: val,
+                                    },
+                                );
+                            } else {
+                                eprintln!("VIEW {nv}: no prepared value — awaiting fresh proposal");
+                            }
+                        }
                     }
                 }
             }
