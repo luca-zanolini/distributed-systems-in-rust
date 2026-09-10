@@ -27,9 +27,19 @@ def keygen():
                    capture_output=True)
 
 
-def launch(ports=ALL):
-    """Start the given nodes; return {port: Popen}. Nodes not listed are 'down'."""
-    keygen()
+def launch(ports=ALL, fresh_keys=True, fresh_state=True):
+    """Start the given nodes; return {port: Popen}. Nodes not listed are 'down'.
+
+    fresh_state wipes pbft-<port>.state files so a demo starts from view 0 —
+    otherwise nodes RECOVER the previous demo's decisions from disk (which is
+    exactly the point of the crash_recovery demo, and a trap for every other)."""
+    if fresh_keys:
+        keygen()
+    if fresh_state:
+        for p in ALL:
+            path = os.path.join(CRATE, f"pbft-{p}.state")
+            if os.path.exists(path):
+                os.remove(path)
     procs = {}
     for p in ports:
         procs[p] = subprocess.Popen(

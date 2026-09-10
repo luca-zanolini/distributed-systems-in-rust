@@ -25,3 +25,5 @@ __pycache__/
 *.pdf
 reference/*
 !reference/README.md
+keys/
+pbft-*.state

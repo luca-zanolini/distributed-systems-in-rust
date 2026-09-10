@@ -65,8 +65,9 @@ struct State {
     view: u64,
     viewchanges: HashMap<String, (u64, Option<Cert>)>, // per sender: the view they want, the certificate they present
     sentcommit: bool,
-    decided: bool,
+    decided: Option<String>,
     preprepared: bool,
+    my_prepare: Option<(u64, String)>, // the (view, value) I last signed a PREPARE for
     prepared: Option<Cert>,
     prepares: HashMap<String, (String, String)>, // per sender: (value, hex signature over the statement)
     commits: HashMap<String, String>,
@@ -175,6 +176,33 @@ fn broadcast(peers: &[String], me: &str, message: &Message) {
     send_to(&targets, message);
 }
 
+#[derive(Serialize, Deserialize)]
+struct Persistent {
+    view: u64,
+    my_prepare: Option<(u64, String)>,
+    prepared: Option<Cert>,
+    decided: Option<String>,
+}
+
+fn persist(s: &State, path: &str) {
+    let p = Persistent {
+        view: s.view,
+        my_prepare: s.my_prepare.clone(),
+        prepared: s.prepared.clone(),
+        decided: s.decided.clone(),
+    };
+    let json = serde_json::to_string(&p).expect("state serializes");
+
+    let mut file = std::fs::File::create(path).expect("create state file");
+    file.write_all(json.as_bytes()).expect("write state");
+    file.sync_all().expect("fsync state");
+}
+
+fn load(path: &str) -> Option<Persistent> {
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -199,22 +227,35 @@ fn main() {
 
     let (sk, pks) = load_keys(&port, &nodes);
 
-    let state: Arc<Mutex<State>> = Arc::new(Mutex::new(State {
-        view: 0,
+    let n = peers.len() + 1;
+    let f = (n - 1) / 3;
+    eprintln!("n = {n}, f = {f}");
+
+    let state_path = format!("pbft-{port}.state");
+    let disk = load(&state_path);
+    if let Some(p) = &disk {
+        eprintln!("RECOVERED: view={}, decided={:?}", p.view, p.decided);
+    }
+
+    let view = disk.as_ref().map_or(0, |p| p.view);
+    let my_prepare = disk.as_ref().and_then(|p| p.my_prepare.clone());
+    let preprepared = my_prepare.as_ref().is_some_and(|(v, _)| *v == view);
+
+    let mut initial = State {
+        view: view,
         viewchanges: HashMap::new(),
         sentcommit: false,
-        decided: false,
-        preprepared: false,
-        prepared: None,
+        decided: disk.as_ref().and_then(|p| p.decided.clone()),
+        preprepared: preprepared,
+        my_prepare: my_prepare,
+        prepared: disk.as_ref().and_then(|p| p.prepared.clone()),
         prepares: HashMap::new(),
         commits: HashMap::new(),
         sent_viewchange: false,
         view_entered: Instant::now(),
-    }));
+    };
 
-    let n = peers.len() + 1;
-    let f = (n - 1) / 3;
-    eprintln!("n = {n}, f = {f}");
+    let state = Arc::new(Mutex::new(initial));
 
     {
         let me = me.clone();
@@ -279,30 +320,28 @@ fn main() {
         let me = me.clone();
         let peers = peers.clone();
         let state = Arc::clone(&state);
-        thread::spawn(move || {
-            loop {
-                let timeout = Duration::from_secs(4);
-                thread::sleep(Duration::from_millis(500));
-                let fire = {
-                    let mut s = state.lock().unwrap();
-                    if !s.decided && !s.sent_viewchange && s.view_entered.elapsed() > timeout {
-                        s.sent_viewchange = true;
-                        Some((s.view + 1, s.prepared.clone()))
-                    } else {
-                        None
-                    }
-                };
-                if let Some((nv, prepared)) = fire {
-                    broadcast(
-                        &peers,
-                        &me,
-                        &Message::ViewChange {
-                            from: me.clone(),
-                            newview: nv,
-                            prepared,
-                        },
-                    );
+        thread::spawn(move || loop {
+            let timeout = Duration::from_secs(4);
+            thread::sleep(Duration::from_millis(500));
+            let fire = {
+                let mut s = state.lock().unwrap();
+                if s.decided.is_none() && !s.sent_viewchange && s.view_entered.elapsed() > timeout {
+                    s.sent_viewchange = true;
+                    Some((s.view + 1, s.prepared.clone()))
+                } else {
+                    None
                 }
+            };
+            if let Some((nv, prepared)) = fire {
+                broadcast(
+                    &peers,
+                    &me,
+                    &Message::ViewChange {
+                        from: me.clone(),
+                        newview: nv,
+                        prepared,
+                    },
+                );
             }
         });
     }
@@ -324,6 +363,8 @@ fn main() {
                         && !state.preprepared
                     {
                         state.preprepared = true;
+                        state.my_prepare = Some((v, m.clone()));
+                        persist(&state, &state_path);
                         let stmt = prepare_statement(v, &m);
                         broadcast(
                             &peers,
@@ -376,6 +417,7 @@ fn main() {
                             value: m.clone(),
                             sigs: cert_sigs,
                         });
+                        persist(&state, &state_path);
                         broadcast(
                             &peers,
                             &me,
@@ -391,8 +433,9 @@ fn main() {
                     let mut state = state.lock().unwrap();
                     state.commits.entry(from).or_insert(m.clone());
                     let count = state.commits.values().filter(|v| **v == m).count();
-                    if count > 2 * f && !state.decided && v == state.view {
-                        state.decided = true;
+                    if count > 2 * f && state.decided.is_none() && v == state.view {
+                        state.decided = Some(m.clone());
+                        persist(&state, &state_path);
                         eprintln!("DECIDED on message: {}", m);
                     }
                 }
@@ -431,6 +474,7 @@ fn main() {
                         state.preprepared = false;
                         state.sentcommit = false;
                         state.view_entered = Instant::now();
+                        persist(&state, &state_path);
                         eprintln!("ENTERED VIEW {}", nv);
                         if leader_of(nv, &nodes) == me {
                             let mut max_prepared: Option<Cert> = None;
