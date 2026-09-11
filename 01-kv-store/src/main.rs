@@ -3,8 +3,9 @@
 //! In the language of the reference text (Cachin, Guerraoui & Rodrigues, *Introduction to
 //! Reliable and Secure Distributed Programming*, 2nd ed., 2011 — "CCGR"): a KV store is a set of
 //! read/write **registers**, one per key (CCGR Ch. 4). This is the single-process, failure-free
-//! case, so the register is trivially atomic. `save`/`load` below is **stable storage**
-//! (CCGR §2.2.4) — what a process uses to survive a crash and recover its state.
+//! case, so the register is trivially atomic. `save`/`load` below gestures at **stable
+//! storage** (CCGR §2.2.4) — what a process uses to survive a crash and recover its state —
+//! but unlike true stable storage it persists only on orderly exit, not across a crash.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -35,8 +36,12 @@ impl Store {
     }
 
     fn save(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Write-then-rename: fs::write alone truncates the file in place, so a
+        // crash mid-save could destroy the PREVIOUS store too. rename is atomic.
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        let tmp = format!("{path}.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -57,7 +62,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut line = String::new();
         let bytes = io::stdin().read_line(&mut line).unwrap();
         if bytes == 0 {
-            break; // EOF: Ctrl+D, or end of piped input
+            // EOF (Ctrl+D, or end of piped input) is an orderly exit too —
+            // persist, exactly as the `exit` command does.
+            store.save("store.db")?;
+            break;
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
         match parts.as_slice() {

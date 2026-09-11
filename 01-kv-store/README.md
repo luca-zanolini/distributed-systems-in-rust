@@ -46,7 +46,7 @@ The abstraction also matters in practice. KV stores are the substrate of modern 
 |---|---|---|
 | Redis, Memcached | in-memory cache, sessions, rate limiting | single-node / weak |
 | etcd, ZooKeeper, Consul | cluster configuration, service discovery, locks, leader election | strong (consensus-backed) |
-| DynamoDB, Cassandra, Riak | highly available storage at scale | eventual |
+| DynamoDB, Cassandra, Riak | highly available storage at scale | eventual by default; tunable/strong reads available |
 | RocksDB, LevelDB, Bitcask | embedded storage engines inside larger databases | single-node engine |
 
 Kubernetes stores its entire cluster state in etcd; Amazon's Dynamo was designed around the
@@ -105,8 +105,9 @@ a point this course returns to repeatedly (Modules 07 and 08 both depend on it, 
 *persist before you externalize*).
 
 This module implements the weakest useful form of durability: the store is serialized to disk
-(`store.db`, JSON via `serde`) when the user exits, and reloaded on startup. Data therefore
-survives an orderly restart but not a crash — a distinction made precise in §6.
+(`store.db`, JSON via `serde`) on any orderly exit — the `exit` command or end-of-input
+(Ctrl-D / end of a pipe) — and reloaded on startup. Data therefore survives an orderly
+restart but not a crash — a distinction made precise in §6.
 
 Two further observations that recur throughout the course:
 
@@ -140,8 +141,8 @@ Two further observations that recur throughout the course:
 
 ### 5.3 Notes on the Rust implementation
 
-- **Ownership expresses intent:** `get` borrows (`Option<&String>`); `remove` returns an owned
-  `String`, because the map relinquishes the value.
+- **Ownership expresses intent:** `get` borrows (`Option<&String>`); `remove` returns
+  `Option<String>` — owned, because the map relinquishes the value.
 - **Multi-word values:** the slice-rest pattern (`rest @ ..`) with `join(" ")` admits values
   containing spaces.
 - **Error handling:** file and JSON operations return `Result`; `?` propagates to `main`, whose
@@ -152,8 +153,11 @@ Two further observations that recur throughout the course:
 Each limitation below is deliberate and names the module or technique that addresses it.
 
 - **Not crash-safe.** State is saved only on exit; a crash beforehand loses all writes since
-  startup. Crash safety requires logging each update to stable storage *before* acknowledging it
-  (write-ahead logging + `fsync`). *(→ stable storage discipline, Modules 07–08.)*
+  startup. (The save itself is write-then-`rename`, so a crash *during* save cannot destroy
+  the previously persisted file — but there is still no `fsync`, so a power loss can lose even
+  a "completed" save.) Crash safety requires logging each update to stable storage *before*
+  acknowledging it (write-ahead logging + `fsync`). *(→ stable storage discipline,
+  Modules 07–08.)*
 - **O(n) persistence.** The entire store is rewritten on save. Append-only logs and LSM-trees
   make the cost of persistence proportional to the update, at the price of compaction machinery.
 - **Single process.** No network interface. *(→ Module 02.)*
@@ -163,7 +167,9 @@ Each limitation below is deliberate and names the module or technique that addre
 ## 7. Exercises
 
 1. **(Crash safety.)** Modify the implementation to append each successful `set`/`remove` to a
-   log file and `fsync` it before printing the confirmation, replaying the log on startup.
+   log file and `fsync` it before returning to the prompt (add an `OK` acknowledgment for
+   `set`, so the guarantee has an observable acknowledgment point), replaying the log on
+   startup.
    Measure the throughput cost relative to the current design. What is the crash-safety guarantee
    now, stated precisely?
 2. **(Compaction.)** The log of Exercise 1 grows without bound. Implement periodic compaction
@@ -223,7 +229,7 @@ remove name           -> Removed: Luca
 get name              -> Key not found
 exit
 ```
-State is written to `store.db` (JSON) on exit and reloaded on startup.
+State is written to `store.db` (JSON) on any orderly exit (`exit` or end-of-input) and reloaded on startup.
 
 ---
 *[Course home](../) · Next: [Module 02 — The Networked Store](../02-networked-kv-store/)*

@@ -55,7 +55,8 @@ decisions; this module uses thread-per-connection and discusses its limits.
   TCP, together with the operating system's transport implementation, provides this abstraction,
   which is why the module does not re-implement retransmission or deduplication (cf. CCGR §2.4.7).
 - **Failures: crash-stop (CCGR §2.2.2).** A process may fail by halting and thereafter takes no
-  further steps. A process that never fails in an execution is **correct** in that execution. A
+  further steps. A process that never fails and takes infinitely many steps in an execution
+  is **correct** in that execution (CCGR §2.2.2). A
   client that disconnects abruptly (EOF, connection reset, broken pipe) is modeled as a crashed
   process; the server must remain correct.
 - **Timing.** No timing assumptions are needed in this module: the server is purely reactive.
@@ -108,7 +109,9 @@ which is shared as `Arc<Mutex<Store>>`:
 
 **Lock granularity determines concurrency.** A mutex held for the duration of a single
 *operation* lets clients interleave; the same mutex held for the duration of a *connection*
-serializes all clients silently — the service remains correct but is no longer concurrent. This
+serializes all clients silently — safety is preserved, but the liveness property of §2 now
+holds only if every connection terminates: an idle connected client holds the lock forever and
+starves all others. This
 implementation locks per operation. (The distinction was discovered here as a live bug, and
 recurs in Module 07 as the rule *never hold a lock across network I/O*.)
 
@@ -123,7 +126,8 @@ in [CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md).
 ### 3.3 Fault isolation
 
 A service must tolerate the crash of its clients. The per-connection handler returns
-`Result`; the accept loop logs a handler's error and continues serving. A client's abrupt
+`Result`; the per-connection thread logs its handler's error and exits, leaving the accept
+loop unaffected and serving. A client's abrupt
 disconnection — a crash in the model of §2 — is thereby contained: the failure of one connection
 never terminates the process. This is the module's first exercise in *fault tolerance*, in its
 simplest form.
@@ -136,7 +140,7 @@ simplest form.
 | perfect point-to-point links (PL1–PL3) | assumed from TCP; not re-implemented |
 | framing over a byte stream | `\n`-terminated lines; `BufReader::lines()` |
 | request/response (RPC) | one command line in, one response line out |
-| crash-stop client failure, fault isolation | `handle_client → Result`; accept loop logs and continues |
+| crash-stop client failure, fault isolation | `handle_client → Result`; the connection's thread logs and exits, accept loop unaffected |
 | local mutual exclusion | `Arc<Mutex<Store>>`, locked per operation |
 
 ## 5. Limitations and outlook
@@ -162,8 +166,10 @@ simplest form.
    adversarial length field), and how should the server bound them?
 3. **(Lock granularity.)** Modify the server to hold the store's lock for an entire connection,
    and demonstrate experimentally — with two concurrent clients — that throughput degrades to
-   that of a sequential server while correctness is preserved. Explain why no test that uses a
-   single client can detect the change.
+   that of a sequential server while safety is preserved — then exhibit the sharper failure:
+   a client that connects and idles starves every other client, violating the liveness
+   property of §2 outright. Explain why no test that uses a single client can detect either
+   change.
 4. **(End-to-end argument.)** TCP provides PL1–PL3 per connection, yet a client that reconnects
    and retries a `set` after a timeout can still cause a duplicate write. Reconcile this with
    PL2, and propose a mechanism (request identifiers, idempotent operations) restoring
