@@ -155,7 +155,8 @@ Mechanics carried over from Module 10, now load-bearing for consensus:
   the same listener arms as everyone else's: all state transitions live in one place.
 - **The threshold.** `2·count > n + f` (with `n = 3f + 1`: at least `2f + 1`) is the
   Byzantine quorum: two such sets intersect in more than `f` processes — hence in at
-  least one *correct* process (Malkhi & Reiter's masking-quorum argument, already used
+  least one *correct* process (Byzantine quorum intersection, cf. Malkhi & Reiter 1998;
+  already used
   for Bracha's echo quorum in Module 10).
 - **Acceptance guard.** A node accepts one PRE-PREPARE per view, only from `leader(v)`,
   only for its current view.
@@ -207,8 +208,18 @@ equivocation, silence, and slowness without distinguishing them — it does not 
 ### 6.2 Complain, join, enter (CCGR Algorithm 5.15's shape)
 
 - **Complain:** timer fires → broadcast `VIEWCHANGE(view+1, prepared)`, where
-  `prepared : Option<(view, value)>` is the highest prepare certificate this node ever
-  assembled (`-` on the wire for none). One complaint per view (`sent_viewchange`).
+  `prepared : Option<Cert>` is the highest prepare certificate this node ever
+  assembled. One complaint per target view, deduplicated and escalated by the
+  monotone counter `highest_vc_sent`.
+- **Complaining is abandonment (the cutoff).** A process that has complained past its
+  current view **stops participating in it**: all three vote arms require
+  `highest_vc_sent <= view`, and the counter is persisted before the complaint is
+  sent. This is CCGR's `halt`-on-abort (Alg. 5.18) and PBFT's rule that a view-changing
+  replica stops accepting messages in the views it left behind — and it is
+  load-bearing for safety, not hygiene: without it, a process could truthfully claim
+  "nothing prepared" in its VIEWCHANGE and *then* help decide a value in the old view,
+  opening the next view unconstrained — agreement breakable by message scheduling
+  alone, zero Byzantine nodes (§7.2).
 - **Join:** on receiving **> f** distinct VIEWCHANGEs for a view ahead of mine, send
   mine too, even if my own timer has not fired. More than `f` complainers must include
   a correct one, so the complaint is real; and f liars alone can never depose a working
@@ -230,7 +241,8 @@ phase, write phase, and accept — see §9) — and applies the selection rule:
 
 The re-proposal is an ordinary PRE-PREPARE for the new view — replicas need no special
 handling; the new view simply replays the standard protocol. `demos/view_change_unwedge.py`
-shows the full arc: wedge → `ENTERED VIEW 1` → *"no prepared value — awaiting fresh
+shows the full arc: wedge → `ENTERED VIEW 1 (leader …, expected None)` → *(nothing
+certified — the leader may propose fresh
 proposal"* (correct: the wedge formed no certificate) → `propose c` → all four decide,
 Byzantine ex-leader included. M2's permanent wedge becomes a five-second detour.
 
@@ -332,6 +344,7 @@ survive power loss rather than merely process death):
 | `my_prepare` — the `(view, value)` I *signed* | the anti-self-equivocation record: "I already spoke in this view" |
 | `prepared` — my highest certificate | the lock-in witness my future VIEWCHANGEs must present |
 | `decided` | integrity across restarts |
+| `highest_vc_sent` | the abandon rule must survive a crash — a rebooted node must not resume voting in a view it complained past |
 
 Deliberately *not* persisted: the tally maps (soft quorum-evidence, re-accumulable —
 losing them costs at worst this view's progress) and the one-shot flags (re-sent
@@ -364,7 +377,14 @@ rule, provided claims are truthful.
 **Proof sketch** (the counting is CCGR's, pp. 257–258). Deciding requires > 2f COMMITs;
 each COMMIT sender holds a prepare certificate for `(v, m)`; so at least `2f + 1`
 processes — among them at least `f + 1` correct — hold that certificate and will claim
-`(v, m)` (or a later certificate; see below) in every subsequent VIEWCHANGE. Any enter
+`(v, m)` (or a later certificate; see below) in every subsequent VIEWCHANGE. The word
+"subsequent" is doing real work, and it is the **abandon rule** (§6.2) that pays for
+it: because a correct process stops voting in a view once it has complained past it,
+its COMMIT causally *precedes* any VIEWCHANGE it later sends, so the later claim
+necessarily reports the certificate. Without the cutoff this step is false — a
+truthful `None` claim could be followed by a decision in the abandoned view (CCGR's
+proof leans on exactly this via `halt`-on-abort, printed p. 257: "no correct process
+has sent a WRITE message in any epoch between ts′ and ts*"). Any enter
 quorum has size ≥ `2f + 1`; two sets of ≥ `2f + 1` among `3f + 1` processes intersect in
 ≥ `f + 1`, hence in a correct process. So **every possible view-change quorum contains
 at least one truthful claim of `(v, m)`** — the decided value is structurally impossible
@@ -460,13 +480,17 @@ certificates is the one no signature can stop: a leader that forwards honest evi
 and lies about its *conclusion* — which is why the NewView's re-derivation layer
 (§6.4) exists, and why `byzantine_new_leader.py` is the module's true final exam.
 
-**Historical note: the MAC detour.** PBFT's celebrated throughput came from replacing
-signatures with vectors of pairwise MACs (Castro & Liskov's TOCS 2002 version and
-Castro's thesis) — but MACs are precisely *non-transferable*, so the view change had to
-be redesigned around the hearsay problem, and grew substantially more complex. That
-complexity proved expensive downstream: Zyzzyva (SOSP 2007) carried a view-change
-safety bug found a decade later (Abraham et al., 2017), and Aardvark (NSDI 2009) showed
-even *clients* could exploit MAC tricks to wedge MAC-based protocols. Modern practice
+**Historical note: the MAC detour.** PBFT's celebrated throughput already rested on
+MACs in **OSDI 1999**: the common case was authenticated with vectors of pairwise MACs,
+while view-change and new-view messages still carried signatures. The **TOCS 2002**
+version and Castro's thesis then eliminated those remaining signatures too — and
+because MACs are precisely *non-transferable*, the view change had to be redesigned
+around the hearsay problem, growing substantially more complex. The descendants show
+both costs: Zyzzyva (SOSP 2007) carried a view-change safety bug found a decade later
+(Abraham et al., 2017 — rooted in its *speculative fast path*'s interaction with the
+view change, a complexity-of-the-rare-path lesson rather than a MAC artifact), and
+Aardvark (NSDI 2009) showed even *clients* could exploit MAC authenticators to wedge
+MAC-based protocols outright. Modern practice
 returned to signing every vote — Ed25519 and BLS made signatures cheap, and the
 blockchain generation *needs* transferability anyway: a light client verifying a commit
 certificate, or a slashing proof of equivocation (Ethereum, Tendermint), is exactly a
@@ -497,7 +521,7 @@ opposite amortization — and the asymmetry is *why* PBFT was "practical."
 | `prepared: Option<(v, m)>` | `(valts, val)` + writeset | prepared certificate |
 | COMMIT, quorum | ACCEPT, quorum | COMMIT, `2f + 1` |
 | progress timer → VIEWCHANGE | complaint → NEWEPOCH | timer → VIEW-CHANGE |
-| join on `> f` | NEWEPOCH amplification `> f` | — (implicit) |
+| join on `> f` | NEWEPOCH amplification `> f` | f+1 view-changes → join (OSDI §4.5.2) |
 | enter on `> 2f` | start epoch on `> 2f` | NEW-VIEW from `2f + 1` VCs |
 | read-phase max-prepared-view selection (`select_value`) | `binds` / `quorumhighest` / `certifiedvalue` over collected `S` | new primary's pre-prepare selection from `V` |
 | `NewView { vcs, proposal, sig }` | **Signed Conditional Collect** (Module 5.14, Alg. 5.16): `[COLLECTED, M, Σ]` | NEW-VIEW with signed VIEWCHANGEs + bundled pre-prepares |
@@ -520,7 +544,8 @@ and state-transfer for laggards.
 | trusted setup | `keygen` subcommand → `keys/<port>.sk/.pk`; `load_keys` at boot |
 | canonical node order / `leader(v)` | `nodes.sort_by_key(port_of)`; `leader_of` |
 | one PRE-PREPARE per view, leader-only, constrained | PrePrepare arm: leader + view + `!preprepared` + `expected.is_none_or(\|e\| *e == m)` |
-| first-testimony-wins tallies | `prepares` / `commits` / `viewchanges` maps, `entry(from).or_insert` |
+| first-testimony-wins, view-pure tallies | Prepare/Commit arms record only current-view votes; `entry(from).or_insert`; `viewchanges` keeps each sender's highest-view claim |
+| the abandon rule (cutoff) | all three vote arms require `highest_vc_sent <= view`; the counter is persisted |
 | Byzantine quorum | `2 * count > n + f` in the Prepare and Commit arms |
 | prepare certificate (real object) | `Cert { view, value, sigs }` assembled from the tally at quorum; checked by `verify_cert` (distinct signers, per-sig soft-fail, `2·valid > n+f`) |
 | progress timer + escalation | timer thread: 500 ms poll, 4 s timeout; `target = view.max(highest_vc_sent) + 1`; clock reset on fire |
@@ -528,7 +553,7 @@ and state-transfer for laggards.
 | leader's collect-and-forward | count branch (`> 2f`): harvest signed records → `select_value` → broadcast NewView; **no state mutation** |
 | the only door into a view | NewView arm: guards → rebuild-and-`verify_envelope` each record → ≥ 2f+1 distinct → re-run `select_value` → proposal must match → enter + `expected` + embedded prepare |
 | uniform self-entry (liar self-rejects) | `broadcast` self-send → the leader processes its own NewView through the same arm |
-| persist-before-externalize | `persist()` (serde_json + `sync_all`) at the four mutation sites; `load()` + derived `preprepared` at boot |
+| persist-before-externalize | `persist()` (serde_json + `sync_all`) at every mutation site, including the complaint counter; `load()` + derived `preprepared` at boot |
 | view-scoped reset vs survivors | tallies/flags/`expected` cleared on entry; `decided`, `prepared`, `my_prepare`, `highest_vc_sent` survive |
 | chaos knobs | `--drop-commits` (skip incoming COMMITs), `--evil-leader` (override the NewView proposal); stdin: `bcast equiv a b`, `fakecert m` |
 
@@ -560,7 +585,9 @@ the view-entry race — are **closed** (certificates §6.4–6.5, envelope authe
    (Exercise 12 makes illegal states unrepresentable).
 7. **Duplicate NewViews.** Between quorum and its own loopback entry, extra arriving
    VIEWCHANGEs can re-trigger the leader's broadcast; receivers deduplicate via the
-   `view <= state.view` guard. Harmless chatter, documented rather than guarded.
+   `view <= state.view` guard. Mostly harmless — but a re-triggered NewView can
+   harvest a *different* record set and proposal, splitting entry state within one
+   view and wedging it until the timer rotates. Liveness-only, timeout-absorbed.
 8. **The Byzantine repertoire is scripted.** Equivocation, silence, forged
    certificates, a lying NewView — each a targeted experiment confirming a specific
    prediction, not an adversarial search over all behaviors; and the demos assert
@@ -619,7 +646,7 @@ the view-entry race — are **closed** (certificates §6.4–6.5, envelope authe
   a theoretical curiosity — synchronous protocols with unrealistic assumptions or
   asynchronous ones with prohibitive costs. Castro & Liskov's title was a thesis
   statement: three message delays, MACs instead of signatures, and a replicated NFS
-  within a few percent of the unreplicated one. The `n = 3f + 1` bound it inhabits is
+  within a few percent of the unreplicated one. The `3f + 1` bound traces to
   Pease–Shostak–Lamport (1980); its partial-synchrony liveness stance is DLS (1988);
   FLP (1985) is why *some* extra assumption is non-negotiable.
 - **The optimization that bit back.** The MAC fast path's complex view change became a
@@ -644,7 +671,8 @@ the view-entry race — are **closed** (certificates §6.4–6.5, envelope authe
 **Primary.**
 
 - M. Castro, B. Liskov. *Practical Byzantine Fault Tolerance.* OSDI 1999. — The
-  protocol this module implements, single-shot and unsigned.
+  protocol whose single-slot core this module implements (the original is multi-shot,
+  MAC-authenticated in the common case, signed at the view change).
 - M. Castro, B. Liskov. *Practical Byzantine Fault Tolerance and Proactive Recovery.*
   ACM TOCS 20(4), 2002. — The full system: MAC optimization, view-change details,
   checkpoints, recovery.

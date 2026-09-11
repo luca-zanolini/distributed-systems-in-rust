@@ -4,7 +4,7 @@ new leader's proposal decides.
 The equivocation wedge from the previous demo, left to run: after the 4-second
 progress timeout every node broadcasts VIEWCHANGE for view 1 (join on >f,
 enter on >2f). Nobody holds a prepare certificate, so the new leader 7001 logs
-'no prepared value — awaiting fresh proposal'; we then have it propose 'c',
+'expected None' (nothing certified); we then have it propose 'c',
 and the ordinary three-phase protocol decides it in view 1 — Byzantine
 ex-leader included, since its malice was only ever in its scripted proposal."""
 import common as c

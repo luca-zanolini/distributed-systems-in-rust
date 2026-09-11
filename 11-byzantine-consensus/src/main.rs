@@ -258,6 +258,8 @@ struct Persistent {
     my_prepare: Option<(u64, String)>,
     prepared: Option<Cert>,
     decided: Option<String>,
+    #[serde(default)]
+    highest_vc_sent: u64, // the abandon rule must survive a crash
 }
 
 fn persist(s: &State, path: &str) {
@@ -266,6 +268,7 @@ fn persist(s: &State, path: &str) {
         my_prepare: s.my_prepare.clone(),
         prepared: s.prepared.clone(),
         decided: s.decided.clone(),
+        highest_vc_sent: s.highest_vc_sent,
     };
     let json = serde_json::to_string(&p).expect("state serializes");
 
@@ -354,7 +357,7 @@ fn main() {
         prepared: disk.as_ref().and_then(|p| p.prepared.clone()),
         prepares: HashMap::new(),
         commits: HashMap::new(),
-        highest_vc_sent: 0,
+        highest_vc_sent: disk.as_ref().map_or(0, |p| p.highest_vc_sent),
         view_entered: Instant::now(),
         expected: None,
     };
@@ -459,6 +462,7 @@ fn main() {
         let peers = peers.clone();
         let state = Arc::clone(&state);
         let sk = sk.clone();
+        let state_path = state_path.clone();
         thread::spawn(move || {
             loop {
                 let timeout = Duration::from_secs(4);
@@ -469,6 +473,7 @@ fn main() {
                         let target = s.view.max(s.highest_vc_sent) + 1;
                         s.highest_vc_sent = target;
                         s.view_entered = Instant::now();
+                        persist(&s, &state_path);
                         Some((target, s.prepared.clone()))
                     } else {
                         None
@@ -518,6 +523,7 @@ fn main() {
                     let mut state = state.lock().unwrap();
                     if from == leader_of(state.view, &nodes)
                         && v == state.view
+                        && state.highest_vc_sent <= state.view
                         && !state.preprepared
                         && state.expected.as_ref().is_none_or(|e| *e == m)
                     {
@@ -544,9 +550,18 @@ fn main() {
                     sig,
                 } => {
                     let mut state = state.lock().unwrap();
+                    // Tallies are view-pure: a vote is recorded only if it is for MY
+                    // current view — stale cross-view votes must never pollute a quorum.
+                    // And the ABANDON rule: once I have complained past my current view
+                    // (highest_vc_sent > view), I stop participating in it — the cutoff
+                    // that makes the lock-in proof's "subsequent VIEWCHANGE" causally
+                    // meaningful (CCGR's halt-on-abort; PBFT's stop-accepting rule).
+                    if v != state.view || state.highest_vc_sent > state.view {
+                        continue;
+                    }
                     state.prepares.entry(from).or_insert((m.clone(), sig));
                     let count = state.prepares.values().filter(|(val, _)| *val == m).count();
-                    if 2 * count > n + f && !state.sentcommit && v == state.view {
+                    if 2 * count > n + f && !state.sentcommit {
                         state.sentcommit = true;
                         let cert_sigs: Vec<(String, String)> = state
                             .prepares
@@ -581,9 +596,13 @@ fn main() {
                         eprintln!("CHAOS: dropping COMMIT from {from}");
                         continue;
                     }
+                    // View-pure tally + the abandon rule, as in the Prepare arm.
+                    if v != state.view || state.highest_vc_sent > state.view {
+                        continue;
+                    }
                     state.commits.entry(from).or_insert(m.clone());
                     let count = state.commits.values().filter(|v| **v == m).count();
-                    if count > 2 * f && state.decided.is_none() && v == state.view {
+                    if 2 * count > n + f && state.decided.is_none() {
                         state.decided = Some(m.clone());
                         persist(&state, &state_path);
                         eprintln!("DECIDED on message: {}", m);
@@ -612,6 +631,7 @@ fn main() {
                         .count();
                     if count >= f + 1 && nv > state.highest_vc_sent && nv > state.view {
                         state.highest_vc_sent = nv;
+                        persist(&state, &state_path);
                         broadcast(
                             &peers,
                             &me,
