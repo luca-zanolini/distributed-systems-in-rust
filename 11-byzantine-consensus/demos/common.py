@@ -78,7 +78,7 @@ def decisions(lines):
 
 def views_entered(lines):
     """Extract the view numbers this node entered."""
-    return [int(l.split("ENTERED VIEW")[1].strip())
+    return [int(l.split("ENTERED VIEW")[1].strip().split()[0])
             for l in lines if "ENTERED VIEW" in l]
 
 

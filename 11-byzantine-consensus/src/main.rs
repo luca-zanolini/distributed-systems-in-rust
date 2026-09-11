@@ -52,6 +52,13 @@ enum Message {
         prepared: Option<Cert>,
         sig: String,
     },
+    NewView {
+        from: String,
+        view: u64,
+        vcs: Vec<(String, u64, Option<Cert>, String)>,
+        proposal: Option<String>,
+        sig: String,
+    },
 }
 
 /// The canonical, domain-separated statement an envelope signature covers.
@@ -71,6 +78,17 @@ fn statement(msg: &Message) -> String {
             newview,
             serde_json::to_string(prepared).expect("claim serializes")
         ),
+        Message::NewView {
+            view,
+            vcs,
+            proposal,
+            ..
+        } => format!(
+            "NEWVIEW:{}:({}:{})",
+            view,
+            serde_json::to_string(vcs).expect("vcs serializes"),
+            serde_json::to_string(proposal).expect("proposal serializes")
+        ),
     }
 }
 
@@ -83,7 +101,8 @@ fn seal(msg: &Message, sk: &SigningKey) -> String {
         Message::PrePrepare { sig, .. }
         | Message::Prepare { sig, .. }
         | Message::Commit { sig, .. }
-        | Message::ViewChange { sig, .. } => *sig = signature,
+        | Message::ViewChange { sig, .. }
+        | Message::NewView { sig, .. } => *sig = signature,
     }
     let mut s = serde_json::to_string(&sealed).expect("message serializes");
     s.push('\n');
@@ -102,7 +121,8 @@ fn verify_envelope(msg: &Message, pks: &HashMap<String, VerifyingKey>) -> bool {
         Message::PrePrepare { from, sig, .. }
         | Message::Prepare { from, sig, .. }
         | Message::Commit { from, sig, .. }
-        | Message::ViewChange { from, sig, .. } => (from, sig),
+        | Message::ViewChange { from, sig, .. }
+        | Message::NewView { from, sig, .. } => (from, sig),
     };
     let Some(pk) = pks.get(from) else {
         return false;
@@ -128,6 +148,7 @@ struct State {
     commits: HashMap<String, String>,
     highest_vc_sent: u64, // the highest view I have complained toward
     view_entered: Instant,
+    expected: Option<String>,
 }
 
 /// keygen: write a fresh ed25519 keypair per port under keys/ (hex-encoded).
@@ -332,6 +353,7 @@ fn main() {
         commits: HashMap::new(),
         highest_vc_sent: 0,
         view_entered: Instant::now(),
+        expected: None,
     };
 
     let state = Arc::new(Mutex::new(initial));
@@ -434,32 +456,34 @@ fn main() {
         let peers = peers.clone();
         let state = Arc::clone(&state);
         let sk = sk.clone();
-        thread::spawn(move || loop {
-            let timeout = Duration::from_secs(4);
-            thread::sleep(Duration::from_millis(500));
-            let fire = {
-                let mut s = state.lock().unwrap();
-                if s.decided.is_none() && s.view_entered.elapsed() > timeout {
-                    let target = s.view.max(s.highest_vc_sent) + 1;
-                    s.highest_vc_sent = target;
-                    s.view_entered = Instant::now();
-                    Some((target, s.prepared.clone()))
-                } else {
-                    None
+        thread::spawn(move || {
+            loop {
+                let timeout = Duration::from_secs(4);
+                thread::sleep(Duration::from_millis(500));
+                let fire = {
+                    let mut s = state.lock().unwrap();
+                    if s.decided.is_none() && s.view_entered.elapsed() > timeout {
+                        let target = s.view.max(s.highest_vc_sent) + 1;
+                        s.highest_vc_sent = target;
+                        s.view_entered = Instant::now();
+                        Some((target, s.prepared.clone()))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((nv, prepared)) = fire {
+                    broadcast(
+                        &peers,
+                        &me,
+                        &Message::ViewChange {
+                            from: me.clone(),
+                            newview: nv,
+                            prepared,
+                            sig: String::new(),
+                        },
+                        &sk,
+                    );
                 }
-            };
-            if let Some((nv, prepared)) = fire {
-                broadcast(
-                    &peers,
-                    &me,
-                    &Message::ViewChange {
-                        from: me.clone(),
-                        newview: nv,
-                        prepared,
-                        sig: String::new(),
-                    },
-                    &sk,
-                );
             }
         });
     }
@@ -478,7 +502,8 @@ fn main() {
                     Message::PrePrepare { from, .. }
                     | Message::Prepare { from, .. }
                     | Message::Commit { from, .. }
-                    | Message::ViewChange { from, .. } => from,
+                    | Message::ViewChange { from, .. }
+                    | Message::NewView { from, .. } => from,
                 };
                 eprintln!("DROPPED unauthenticated message claiming from {from}");
                 continue;
@@ -491,6 +516,7 @@ fn main() {
                     if from == leader_of(state.view, &nodes)
                         && v == state.view
                         && !state.preprepared
+                        && state.expected.as_ref().is_none_or(|e| *e == m)
                     {
                         state.preprepared = true;
                         state.my_prepare = Some((v, m.clone()));
@@ -514,9 +540,6 @@ fn main() {
                     m,
                     sig,
                 } => {
-                    // Envelope already verified at the gate — and for Prepare the
-                    // envelope statement IS the certificate statement, so `sig` is
-                    // certificate-grade evidence, safe to store in the tally.
                     let mut state = state.lock().unwrap();
                     state.prepares.entry(from).or_insert((m.clone(), sig));
                     let count = state.prepares.values().filter(|(val, _)| *val == m).count();
@@ -594,37 +617,103 @@ fn main() {
                             &sk,
                         );
                     }
-                    if count > 2 * f && nv > state.view {
-                        state.view = nv;
-                        state.prepares.clear();
-                        state.commits.clear();
-                        state.preprepared = false;
-                        state.sentcommit = false;
-                        state.view_entered = Instant::now();
-                        persist(&state, &state_path);
-                        eprintln!("ENTERED VIEW {}", nv);
-                        if leader_of(nv, &nodes) == me {
-                            let max_prepared = select_value(&state.viewchanges, nv, &pks, n,f);
-                            if let Some(cert) = max_prepared {
-                                eprintln!(
-                                    "Leader {} adopting prepared value from view {}: {}",
-                                    me, cert.view, cert.value
-                                );
-                                broadcast(
-                                    &peers,
-                                    &me,
-                                    &Message::PrePrepare {
-                                        from: me.clone(),
-                                        view: nv,
-                                        m: cert.value,
-                                        sig: String::new(),
-                                    },
-                                    &sk,
-                                );
-                            } else {
-                                eprintln!("VIEW {nv}: no prepared value — awaiting fresh proposal");
-                            }
+                    if count > 2 * f && nv > state.view && leader_of(nv, &nodes) == me {
+                        let vcs: Vec<_> = state
+                            .viewchanges
+                            .iter()
+                            .filter(|(_, (v, _, _))| *v == nv)
+                            .map(|(from, (v, claim, sig))| {
+                                (from.clone(), *v, claim.clone(), sig.clone())
+                            })
+                            .collect();
+                        let proposal =
+                            select_value(&state.viewchanges, nv, &pks, n, f).map(|c| c.value);
+                        broadcast(
+                            &peers,
+                            &me,
+                            &Message::NewView {
+                                from: me.clone(),
+                                view: nv,
+                                vcs,
+                                proposal,
+                                sig: String::new(),
+                            },
+                            &sk,
+                        );
+                    }
+                }
+                Message::NewView {
+                    from,
+                    view,
+                    vcs,
+                    proposal,
+                    ..
+                } => {
+                    let mut state = state.lock().unwrap();
+                    if from != leader_of(view, &nodes) || view <= state.view {
+                        continue;
+                    }
+                    let mut valid: HashMap<String, (u64, Option<Cert>, String)> = HashMap::new();
+                    for (vfrom, vnv, claim, vsig) in &vcs {
+                        let rebuilt = Message::ViewChange {
+                            from: vfrom.clone(),
+                            newview: *vnv,
+                            prepared: claim.clone(),
+                            sig: vsig.clone(),
+                        };
+                        if *vnv == view && verify_envelope(&rebuilt, &pks) {
+                            valid.entry(vfrom.clone()).or_insert((
+                                *vnv,
+                                claim.clone(),
+                                vsig.clone(),
+                            ));
+                        } else {
+                            eprintln!(
+                                "NewView: discarding invalid forwarded record claiming from {vfrom}"
+                            );
                         }
+                    }
+                    if valid.len() < 2 * f + 1 {
+                        eprintln!(
+                            "NewView: not enough valid view change messages, expected at least {}",
+                            2 * f + 1
+                        );
+                        continue;
+                    }
+                    let my_selection = select_value(&valid, view, &pks, n, f).map(|c| c.value);
+                    if my_selection != proposal {
+                        eprintln!(
+                            "NewView REJECTED: leader proposes {proposal:?} but evidence forces {my_selection:?}"
+                        );
+                        continue;
+                    }
+                    state.view = view;
+                    state.prepares.clear();
+                    state.commits.clear();
+                    state.preprepared = false;
+                    state.sentcommit = false;
+                    state.view_entered = Instant::now();
+                    state.expected = my_selection.clone();
+                    persist(&state, &state_path);
+                    eprintln!(
+                        "ENTERED VIEW {view} (leader {from}, expected {:?})",
+                        state.expected
+                    );
+                    if let Some(m) = proposal {
+                        state.preprepared = true;
+                        state.my_prepare = Some((view, m.clone()));
+                        persist(&state, &state_path);
+                        broadcast(
+                            &peers,
+                            &me,
+                            &Message::Prepare {
+                                from: me.clone(),
+                                view,
+                                m,
+                                sig: String::new(),
+                            },
+                            &sk,
+                        );
                     }
                 }
             }

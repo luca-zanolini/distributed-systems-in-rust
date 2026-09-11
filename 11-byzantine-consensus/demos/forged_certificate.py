@@ -33,7 +33,7 @@ c.report(logs, faulty={"7000", "7002"})
 
 leader_log = logs["7001"]
 rejects = [l for l in leader_log if l.startswith("cert:")]
-fresh = any("no prepared value" in l for l in leader_log)
+fresh = any("expected None" in l for l in leader_log)   # entry with no forced value
 ok, vals = c.verdict_agreement(logs, faulty={"7000", "7002"})
 print(f"\n   leader 7001's verification log ({len(rejects)} rejection lines):")
 for l in rejects[:6]:
