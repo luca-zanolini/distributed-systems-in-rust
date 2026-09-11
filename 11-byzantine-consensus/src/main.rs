@@ -306,6 +306,9 @@ fn select_value(
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    let drop_commits = args.iter().any(|a| a == "--drop-commits");
+    let evil_leader = args.iter().any(|a| a == "--evil-leader");
+
     if args.get(1).map(String::as_str) == Some("keygen") {
         keygen(&args[2..]);
         return;
@@ -574,6 +577,10 @@ fn main() {
                     from, view: v, m, ..
                 } => {
                     let mut state = state.lock().unwrap();
+                    if drop_commits {
+                        eprintln!("CHAOS: dropping COMMIT from {from}");
+                        continue;
+                    }
                     state.commits.entry(from).or_insert(m.clone());
                     let count = state.commits.values().filter(|v| **v == m).count();
                     if count > 2 * f && state.decided.is_none() && v == state.view {
@@ -628,6 +635,14 @@ fn main() {
                             .collect();
                         let proposal =
                             select_value(&state.viewchanges, nv, &pks, n, f).map(|c| c.value);
+                        let proposal = if evil_leader {
+                            eprintln!(
+                                "BYZANTINE: evidence forces {proposal:?} — proposing 'evil' anyway"
+                            );
+                            Some("evil".to_string())
+                        } else {
+                            proposal
+                        };
                         broadcast(
                             &peers,
                             &me,

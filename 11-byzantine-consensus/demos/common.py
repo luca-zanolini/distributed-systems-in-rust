@@ -27,7 +27,7 @@ def keygen():
                    capture_output=True)
 
 
-def launch(ports=ALL, fresh_keys=True, fresh_state=True):
+def launch(ports=ALL, fresh_keys=True, fresh_state=True, extra=None):
     """Start the given nodes; return {port: Popen}. Nodes not listed are 'down'.
 
     fresh_state wipes pbft-<port>.state files so a demo starts from view 0 —
@@ -40,10 +40,11 @@ def launch(ports=ALL, fresh_keys=True, fresh_state=True):
             path = os.path.join(CRATE, f"pbft-{p}.state")
             if os.path.exists(path):
                 os.remove(path)
+    extra = extra or {}   # per-port chaos flags, e.g. {"7001": ["--evil-leader"]}
     procs = {}
     for p in ports:
         procs[p] = subprocess.Popen(
-            [BIN, p, *peers_of(p)],
+            [BIN, p, *peers_of(p), *extra.get(p, [])],
             cwd=CRATE,   # nodes read keys/ relative to the crate dir
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True,
