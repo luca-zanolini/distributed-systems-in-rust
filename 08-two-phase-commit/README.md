@@ -14,7 +14,7 @@ Where Module 07's consensus makes progress with any majority, atomic commitment 
 **unanimity** through a single coordinator, and this difference in decision rule produces an
 inversion of fault behavior. The module introduces transactions and their properties (with the
 formal treatment in the theory companion), specifies **non-blocking atomic commitment (NBAC)**
-following CCGR §6.1, presents 2PC and its correctness for the properties it does satisfy,
+following CCGR §6.6, presents 2PC and its correctness for the properties it does satisfy,
 exhibits the blocking execution, connects the participant's in-doubt state to **strict
 two-phase locking**, and surveys the repairs (three-phase commit; **Paxos Commit**, atomic
 commitment over consensus). The domain is a bank transfer across accounts held on different
@@ -92,7 +92,7 @@ This is **atomic commitment**.
 
 ### 1.3 Specification: non-blocking atomic commitment
 
-Following CCGR §6.1, each participant casts a vote in {YES, NO} and processes decide in
+Following CCGR §6.6, each participant casts a vote in {YES, NO} and processes decide in
 {COMMIT, ABORT}:
 
 - **NBAC1 (Uniform agreement — safety).** No two processes decide differently (whether or not
@@ -323,7 +323,7 @@ realizes the §4.1 crash point deterministically, in the tradition of fault inje
 **Reference text**
 - C. Cachin, R. Guerraoui, L. Rodrigues, *Introduction to Reliable and Secure Distributed
   Programming*, 2nd ed., Springer, 2011. For this module: non-blocking atomic commitment
-  (§6.1); consensus (Ch. 5); failure detectors P vs. ◇P (§2.6). ISBN 978-3-642-15259-7.
+  (§6.6); consensus (Ch. 5); failure detectors P vs. ◇P (§2.6). ISBN 978-3-642-15259-7.
 
 **Atomic commitment**
 - J. Gray, *Notes on Data Base Operating Systems*, in *Operating Systems: An Advanced Course*,

@@ -31,5 +31,5 @@ G. DeCandia et al., *Dynamo*, SOSP 2007; A. Das, I. Gupta, A. Motivala, *SWIM*, 
 S. Gilbert & N. Lynch, CAP, SIGACT News 2002.
 
 ---
-*[Course home](../) · Previous: [Module 11 (planned)](../11-byzantine-consensus/) ·
+*[Course home](../) · Previous: [Module 11](../11-byzantine-consensus/) ·
 End of the planned sequence — see the [course home](../) for case-study notes.*
