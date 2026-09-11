@@ -259,7 +259,13 @@ repaired protocol makes the leader **show its work**:
   rejects the NewView outright if the leader's proposal deviates from its own derived
   conclusion. Only then does it enter — clearing view-scoped state and recording the
   derived constraint as `expected`, which the PrePrepare arm enforces for the rest of
-  the view.
+  the view. (A precision worth stating: with the proposal embedded, the PrePrepare-arm
+  `expected` guard is *provably redundant* — `expected.is_some() ⟹ preprepared` holds
+  at all times, so every deviation is caught earlier, at the NewView homework check or
+  at `!preprepared`. It is retained deliberately: it states the view-binding invariant
+  directly rather than leaning on the incidental coupling the embedded design creates,
+  it becomes the *sole* enforcement point in the non-embedded variant of Exercise 6,
+  and its rejection log names the crime where `!preprepared`'s silence would not.)
 - **The leader gets no shortcut.** Its own NewView loops back through its own listener
   and the same arm: it re-verifies its own evidence and checks its own homework. A
   *lying* leader therefore **rejects its own NewView** — the lie exists only in the
