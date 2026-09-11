@@ -4,9 +4,10 @@
 [Module 07 (Raft)](../07-raft/), [Module 10 (Byzantine Reliable Broadcast)](../10-byzantine-broadcast/),
 and the consensus-theory notes in [CONSENSUS.md](../07-raft/CONSENSUS.md).*
 
-*Status: Milestones 1–4 complete — the **unauthenticated** protocol, including a live
-demonstration of exactly why it must not be trusted. Milestone 5 (signed certificates,
-"real PBFT") is planned and motivated by this module's closing demo.*
+*Status: **complete** — normal case, view change, ed25519-signed certificates and
+envelopes, NEW-VIEW re-verification, and stable storage; seven reproducible demos
+including three attacks that bounce. The module was built by iterated attack: each
+security layer exists because a demo first showed its absence being exploited.*
 
 **Abstract.** We implement single-shot Byzantine consensus in the style of PBFT
 (Castro & Liskov, 1999) for `n = 3f + 1` processes: a three-phase normal case
@@ -20,7 +21,18 @@ messages carry bare, unsigned *claims* of prepared values, a single forged messa
 all four nodes unanimously decide a value that no process ever proposed. The failure is
 precise and instructive: first-hand votes need only authenticated channels, but the
 view change forwards *hearsay*, and hearsay requires transferable authentication —
-digital signatures. That diagnosis is the specification for Milestone 5.
+digital signatures. That diagnosis became the specification for the module's second
+half: ed25519-signed prepares assembled into verifiable certificates; envelope
+authentication on every message; a NEW-VIEW protocol in which the new leader *forwards*
+its signed evidence and every replica re-derives the selection instead of trusting it —
+CCGR's signed conditional collect, rediscovered from the attack side; and stable
+storage under persist-before-externalize discipline, because in a signed protocol
+amnesia is not vote-loss but *self-equivocation*. The finale puts a real decision at
+stake and lets a Byzantine new leader lie about the evidence it itself forwards: every
+node — the liar included — re-derives the truth and refuses, the escalating timer
+rotates past the spent view, and the next honest leader is forced by quorum-intersected
+certificates to propose the decided value. The lock-in theorem, executing against a
+live adversary.
 
 ## Learning objectives
 
@@ -37,6 +49,10 @@ After this module you should be able to:
   state, and the read phase's *highest-prepared-view* selection rule;
 - explain why the voting phases need no signatures but the view change does
   (first-hand testimony vs forwarded evidence), and reproduce the forgery attack;
+- state the rule deciding which signatures become certificates (knowledge crossing a
+  boundary) and recognize NEW-VIEW as CCGR's signed conditional collect;
+- explain why crash-recovery without stable storage turns a *signed* correct node into
+  an equivocator, and what persist-before-externalize protects;
 - place PBFT in its lineage: CCGR's Byzantine epoch-change / epoch consensus, the MAC
   optimization and its costs, and the modern signed-vote practice of Tendermint,
   HotStuff, and Ethereum's finality gadget.
@@ -95,12 +111,18 @@ strong validity on screen, and, in runs with a prior decision, agreement itself.
   the optimal `N > 3f` resilience for this model (CCGR §5.6.1).
 - **Timing:** safety must hold under full asynchrony; liveness assumes partial
   synchrony (timeouts eventually suffice — the progress timer is our GST proxy).
-- **Channels:** TCP point-to-point. **Honesty note:** the `from` field of every message
-  is a self-declared string, so our "authenticated links" are a convention that any raw
-  socket can violate — the forgery demo does exactly this. Real deployments close this
-  with per-link authentication (TLS/mTLS, MACs); we accept the gap and document it,
-  because the deeper gap (§8) exists *even with* perfectly authenticated links.
-- **Cryptography:** none, deliberately, until Milestone 5.
+- **Channels:** TCP point-to-point, with **authenticated envelopes implemented**: every
+  message carries an ed25519 signature over a domain-separated canonical statement of
+  its content, verified against the claimed sender's known public key at a single gate
+  before any protocol logic runs (see Module 10's §6.5 for the MAC-vs-signature
+  discussion; here we additionally *exploit transferability* — §6.4).
+- **Cryptography:** ed25519 signatures throughout, under a **trusted setup**: a `keygen`
+  step writes per-node keypairs and all public keys are known to all — the explicit
+  anti-Sybil assumption without which "at most `f` Byzantine" is meaningless.
+- **Crash recovery:** durable facts (`view`, the PREPARE I signed, my certificate, my
+  decision) are fsynced to `pbft-<port>.state` *before* the corresponding message
+  leaves the machine (persist-before-externalize, Module 07's discipline) — see §6.6
+  for why this matters *more* in a signed protocol.
 - **Single shot:** the cluster decides one value, once. Sequence numbers, checkpoints,
   and log truncation — PBFT's machinery for deciding a *stream* of values — are out of
   scope (§9).
@@ -199,7 +221,7 @@ equivocation, silence, and slowness without distinguishing them — it does not 
 ### 6.3 The read phase: what may the new leader propose?
 
 On entering a view it leads, the new leader consults the collected VIEWCHANGE claims —
-its unauthenticated miniature of PBFT's new-view certificate and of CCGR's conditional
+the raw material of PBFT's new-view certificate and of CCGR's conditional
 collect output (Algorithms 5.16–5.18: our `collected`/WRITE/ACCEPT are the book's read
 phase, write phase, and accept — see §9) — and applies the selection rule:
 
@@ -211,6 +233,110 @@ handling; the new view simply replays the standard protocol. `demos/view_change_
 shows the full arc: wedge → `ENTERED VIEW 1` → *"no prepared value — awaiting fresh
 proposal"* (correct: the wedge formed no certificate) → `propose c` → all four decide,
 Byzantine ex-leader included. M2's permanent wedge becomes a five-second detour.
+
+### 6.4 The read phase made verifiable: NEW-VIEW as conditional collect
+
+The selection rule of §6.3 originally ran only in the leader's head — replicas accepted
+any proposal from `leader_of(view)` unchecked, and §8 shows what that permits. The
+repaired protocol makes the leader **show its work**:
+
+- The **VIEWCHANGE tally keeps each sender's envelope signature**. This is the moment a
+  link-authentication signature is promoted to **transferable evidence**: the same bytes
+  that authenticated a first-hand message become an affidavit the instant they are
+  forwarded (Module 10 §6.5's distinction, now load-bearing).
+- On collecting > 2f VIEWCHANGEs for view `v`, the leader-to-be broadcasts
+  **`NewView { view, vcs, proposal, sig }`**: the ≥ 2f+1 signed VIEWCHANGE records it
+  entered on, plus the proposal those records force (`Some(value)`) or `None` if
+  nothing is protected. The proposal rides *inside* the NewView — PBFT bundles its
+  pre-prepares into NEW-VIEW for the same reason — eliminating the ordering race
+  between "enter the view" and "receive the proposal".
+- **Receiving a valid NewView is the only door into a view.** Each replica: verifies
+  the NewView's own envelope (the gate); *rebuilds each forwarded record as the
+  ViewChange it once was and re-verifies it through the same `verify_envelope` code
+  path the original traveled* — shared verification paths, so live and forwarded
+  checking cannot drift; requires ≥ 2f+1 valid, distinct records for this view;
+  **re-runs the identical `select_value` function** over the verified evidence; and
+  rejects the NewView outright if the leader's proposal deviates from its own derived
+  conclusion. Only then does it enter — clearing view-scoped state and recording the
+  derived constraint as `expected`, which the PrePrepare arm enforces for the rest of
+  the view.
+- **The leader gets no shortcut.** Its own NewView loops back through its own listener
+  and the same arm: it re-verifies its own evidence and checks its own homework. A
+  *lying* leader therefore **rejects its own NewView** — the lie exists only in the
+  outbound message, never in the honest arm — and never even enters the view it
+  claimed to open (`demos/byzantine_new_leader.py` shows the liar logging the
+  rejection of its own message).
+- A view that produces no valid entry is **spent**: the complaint counter
+  (`highest_vc_sent`, a monotone high-water mark) escalates the next complaint to
+  `max(view, highest_vc_sent) + 1`, rotating *past* the failed leader instead of
+  re-knocking on its door forever. With `n = 3f + 1`, any `f + 1` consecutive views
+  contain a correct leader; after GST, one of them lands.
+
+This is CCGR's **Signed Conditional Collect** (Module 5.14, Algorithm 5.16), arrived at
+from the attack side: signed inputs = the VIEWCHANGEs; `COLLECTED` = the NewView; the
+integrity property CC2 (a faulty leader cannot attribute inputs to correct processes
+that never made them) = the per-record re-verification; and computing `binds` from the
+collected vector at *every* process = `select_value` shared between leader and
+replicas. When we chose PBFT's shape over the book's stack, we skipped conditional
+collect as happy-path overhead; the view change is where it turns out to be
+load-bearing, and every attack demo since was the protocol saying so.
+
+### 6.5 Which signatures become certificates — and which don't
+
+The module now contains two certificate species — the prepare certificate (`Cert`:
+≥ 2f+1 signed PREPAREs, a quorum about a *value*) and the new-view certificate (the
+`vcs` vector: ≥ 2f+1 signed VIEWCHANGEs, a quorum about *entering a view*) — while
+COMMIT and PREPREPARE signatures are verified at the gate and then discarded. The rule
+deciding who gets collected:
+
+> **A signature gets collected into a certificate if and only if somebody else, in some
+> other context, will later need the proof. Certificates exist exactly where knowledge
+> must cross a boundary — into the next view, to another node, to an outside observer.
+> Where knowledge is consumed on the spot, you count envelopes and throw them away.**
+
+COMMIT quorums are consumed on the spot (each node assembles its own decision from
+envelopes it received first-hand), so no commit certificate exists *here* — but in
+multi-shot systems one does: a laggard catching up, or a light client, is precisely
+"somebody else needing the proof", and Tendermint's block commit is exactly a collected
+certificate of precommits (Exercise 9). A PREPREPARE carries no quorum at all, but its
+signature is not wasted: two signed PREPREPAREs from one leader for one view with
+different values are *transferable proof of equivocation* — slashing evidence, the
+accountability dividend of signing everything.
+
+### 6.6 Stable storage: in a signed protocol, amnesia is self-equivocation
+
+Module 07 taught that a consensus node restarting blank can double-vote and lose
+committed entries. Signatures raise the stakes in kind, not just degree: accept a
+PRE-PREPARE for `a`, *sign* PREPARE `(v, a)`, crash, restart blank — and a Byzantine
+leader gladly re-proposes `b`; you sign `(v, b)`. Two valid signatures from one
+"correct" key on conflicting statements: **the restarted node has manufactured the raw
+material for two conflicting certificates, and the `≤ f` assumption silently collapses
+— crash-recovery without stable storage turns correct nodes Byzantine.** The counting
+argument breaks too: a decision guarantees ≥ 2f+1 certificate holders, but one amnesiac
+leaves 2f, whose intersection with a view-change quorum can be *exactly the liar* at
+`f = 1`.
+
+The persistent subset (fsynced to `pbft-<port>.state` *before* the corresponding
+message is sent — persist-before-externalize; `sync_all()` is the line that makes it
+survive power loss rather than merely process death):
+
+| persisted | why |
+|---|---|
+| `view` | never rewind views — a rewound node re-accepts old-view pre-prepares |
+| `my_prepare` — the `(view, value)` I *signed* | the anti-self-equivocation record: "I already spoke in this view" |
+| `prepared` — my highest certificate | the lock-in witness my future VIEWCHANGEs must present |
+| `decided` | integrity across restarts |
+
+Deliberately *not* persisted: the tally maps (soft quorum-evidence, re-accumulable —
+losing them costs at worst this view's progress) and the one-shot flags (re-sent
+messages are deduplicated by `or_insert` at every receiver — idempotency absorbs
+repetition; only *contradiction* is fatal, and `my_prepare` prevents exactly that).
+`preprepared` is *derived* at load time from `my_prepare`-vs-`view` — persist facts,
+derive judgments. One shape worth stating as an invariant: across a run, `prepared` is
+a **view-monotone step function whose value coordinate is free until the first decision
+anywhere and constant ever after** — that is the lock-in theorem restated as a
+data-structure property (Exercise 10). `demos/crash_recovery.py` kills the entire
+cluster after a decision and restarts it; all four nodes come back knowing.
 
 ## 7. Correctness
 
@@ -268,10 +394,25 @@ delays. Rotation-until-progress *is* the liveness engine — our demo's `ENTERED
 `ENTERED VIEW 2` drumbeat while no proposal existed was not a bug but the protocol
 patiently searching for a leader worth having.
 
-## 8. The forgery: why unsigned view-changes are broken
+## 8. The forgery arc: three attacks, three layers of defense
 
-Everything in §7.2 carried a quiet hypothesis: *"provided claims are truthful."*
-`demos/forged_certificate.py` cashes in that hypothesis. During the wedge, a raw Python
+The module's security was built by iterated attack — each layer exists because a demo
+first exploited its absence. The finished arc, before the story of how it was found:
+
+| attacker | attack | dies at | demo |
+|---|---|---|---|
+| keyless outsider | forged COMMITs → fabricated decision in the *normal case* | the envelope gate | `forged_commits.py` |
+| keyed **insider** (7002) | validly-signed VIEWCHANGE carrying a certificate with garbage inner signatures | `verify_cert` | `forged_certificate.py` |
+| the **new leader itself** | validly-signed NewView with genuine evidence and a lying conclusion | every replica's re-run of `select_value` — including the liar's own | `byzantine_new_leader.py` |
+
+Each layer catches exactly what it can see and nothing more: the gate answers *who
+speaks*; certificate verification answers *whether the forwarded evidence checks out*;
+re-derivation answers *whether the conclusion follows from the evidence*. All three are
+necessary; the demos prove each is insufficient alone.
+
+**How the first hole was found.** Everything in §7.2 carried a quiet hypothesis:
+*"provided claims are truthful."* The original, unauthenticated implementation let a
+raw Python
 socket — not a node at all — sends every node one message:
 
 ```text
@@ -306,7 +447,12 @@ view-change message, the certificate itself — the `2f + 1` *signed* PREPAREs �
 new leader **verifies instead of believes**; its NEW-VIEW message then carries the
 signed view-changes it selected from, so every replica re-verifies the selection too.
 Forging a certificate means producing `2f + 1` valid signatures while controlling `f`
-signers. That is Milestone 5, and this demo is its requirements document.
+signers. This module implements exactly that: the certificate *is* its 2f+1
+signatures, verified — never believed — by leader and replicas alike, and the same
+injection now dies with one rejection line per lie. The residual attacker after
+certificates is the one no signature can stop: a leader that forwards honest evidence
+and lies about its *conclusion* — which is why the NewView's re-derivation layer
+(§6.4) exists, and why `byzantine_new_leader.py` is the module's true final exam.
 
 **Historical note: the MAC detour.** PBFT's celebrated throughput came from replacing
 signatures with vectors of pairwise MACs (Castro & Liskov's TOCS 2002 version and
@@ -347,8 +493,11 @@ opposite amortization — and the asymmetry is *why* PBFT was "practical."
 | progress timer → VIEWCHANGE | complaint → NEWEPOCH | timer → VIEW-CHANGE |
 | join on `> f` | NEWEPOCH amplification `> f` | — (implicit) |
 | enter on `> 2f` | start epoch on `> 2f` | NEW-VIEW from `2f + 1` VCs |
-| read-phase max-prepared-view selection | `binds` / `quorumhighest` / `certifiedvalue` over collected `S` | new primary's pre-prepare selection from `V` |
-| *(absent — the forgery gap)* | signatures in conditional collect | signed VCs + NEW-VIEW re-verification |
+| read-phase max-prepared-view selection (`select_value`) | `binds` / `quorumhighest` / `certifiedvalue` over collected `S` | new primary's pre-prepare selection from `V` |
+| `NewView { vcs, proposal, sig }` | **Signed Conditional Collect** (Module 5.14, Alg. 5.16): `[COLLECTED, M, Σ]` | NEW-VIEW with signed VIEWCHANGEs + bundled pre-prepares |
+| replicas re-verify records + re-run `select_value` | CC1/CC2 + every process computing `binds` from `M` | replicas validate NEW-VIEW before accepting |
+| escalating complaints (`highest_vc_sent`) | timestamps increase past failed epochs | timers per view, exponential in practice |
+| persist-before-externalize (`pbft-<port>.state`) | logged variants (§5.4 style) | replicas log state to stable storage |
 
 **Deliberately omitted from PBFT** (each a signpost, none accidental): sequence numbers
 and pipelining (we decide once; PBFT decides a log), checkpoints/garbage collection and
@@ -359,41 +508,58 @@ and state-transfer for laggards.
 
 | mechanism | code |
 |---|---|
-| message alphabet + wire format | `enum Message`, `encode`/`decode` (`-` sentinel for `None`) |
+| message alphabet + wire format | `enum Message` (5 variants), serde_json lines via `encode`/`decode` |
+| canonical statements, domain-separated | `statement()` — one function for signer and verifier; `prepare_statement` shared with `verify_cert` (certificates outlive their messages) |
+| envelope authentication | `seal` (sign-at-the-choke-point) → wire → the single `verify_envelope` gate before the `match` |
+| trusted setup | `keygen` subcommand → `keys/<port>.sk/.pk`; `load_keys` at boot |
 | canonical node order / `leader(v)` | `nodes.sort_by_key(port_of)`; `leader_of` |
-| one PRE-PREPARE per view, leader-only | PrePrepare arm: `from == leader_of(...) && v == state.view && !preprepared` |
+| one PRE-PREPARE per view, leader-only, constrained | PrePrepare arm: leader + view + `!preprepared` + `expected.is_none_or(\|e\| *e == m)` |
 | first-testimony-wins tallies | `prepares` / `commits` / `viewchanges` maps, `entry(from).or_insert` |
 | Byzantine quorum | `2 * count > n + f` in the Prepare and Commit arms |
-| prepare certificate | `state.prepared = Some((v, m))` at prepare-quorum |
-| progress timer | timer thread: 500 ms poll, 4 s timeout, `!decided && !sent_viewchange` |
-| complain / join / enter | ViewChange arm: broadcast on timer; `count > f` join; `count > 2f && nv > view` enter |
-| view-scoped reset vs survivors | `prepares/commits/preprepared/sentcommit` cleared; `decided`, `prepared` kept |
-| read phase / selection rule | enter branch: max-prepared-view scan → ordinary PRE-PREPARE |
-| view-aware proposing | stdin thread: snapshot `(view, am-I-leader)` under a short lock, send after release |
-| scripted Byzantine leader | `bcast equiv a b`: `send_to` halves, no self-send (vote-withholding) |
+| prepare certificate (real object) | `Cert { view, value, sigs }` assembled from the tally at quorum; checked by `verify_cert` (distinct signers, per-sig soft-fail, `2·valid > n+f`) |
+| progress timer + escalation | timer thread: 500 ms poll, 4 s timeout; `target = view.max(highest_vc_sent) + 1`; clock reset on fire |
+| complain / join | ViewChange arm: record (sig kept — forwardable), `> f` join with `nv > highest_vc_sent` dedup |
+| leader's collect-and-forward | count branch (`> 2f`): harvest signed records → `select_value` → broadcast NewView; **no state mutation** |
+| the only door into a view | NewView arm: guards → rebuild-and-`verify_envelope` each record → ≥ 2f+1 distinct → re-run `select_value` → proposal must match → enter + `expected` + embedded prepare |
+| uniform self-entry (liar self-rejects) | `broadcast` self-send → the leader processes its own NewView through the same arm |
+| persist-before-externalize | `persist()` (serde_json + `sync_all`) at the four mutation sites; `load()` + derived `preprepared` at boot |
+| view-scoped reset vs survivors | tallies/flags/`expected` cleared on entry; `decided`, `prepared`, `my_prepare`, `highest_vc_sent` survive |
+| chaos knobs | `--drop-commits` (skip incoming COMMITs), `--evil-leader` (override the NewView proposal); stdin: `bcast equiv a b`, `fakecert m` |
 
 ## 11. Limitations
 
-Honest list; each is a signpost, and the first two are the point of the module:
+The original list's first three items — unverifiable claims, self-declared identity,
+the view-entry race — are **closed** (certificates §6.4–6.5, envelope authentication
+§3, NewView-synchronized entry §6.4). The honest residue:
 
-1. **Claims, not certificates.** VIEWCHANGE carries an unverifiable `(view, value)`
-   assertion; §8 demonstrates the consequence. Fix: Milestone 5 (signed prepares
-   carried in the view change; NEW-VIEW re-verification).
-2. **Self-declared identity.** Any socket can claim any `from`. Fix: authenticated
-   channels (mTLS/MACs) — orthogonal to, and insufficient without, item 1.
-3. **View-entry race.** Nodes enter a new view at slightly different moments; an eager
-   new leader's PRE-PREPARE can reach a node still in the old view and be dropped
-   (guard `v == state.view`). With loopback latencies this is invisible; under real
-   asynchrony the protocol self-heals only by rotating again. Real PBFT synchronizes
-   entry via the NEW-VIEW message.
-4. **Fixed timeout.** 4 s forever; a network slower than that livelocks through views.
+1. **Trusted setup.** `keygen` + out-of-band public keys is an *assumption*, stated,
+   not solved: the layer authenticates known identities; it cannot conjure the
+   identity space (Sybil). Real systems anchor it in a PKI, a genesis file, or stake.
+2. **Fixed timeout.** 4 s forever; a network slower than that livelocks through views.
    PBFT doubles the timeout per view change (exponential backoff) so that after GST
-   some view eventually outlives the network's actual delay.
-5. **Single-shot.** One decision; no sequence numbers, checkpoints, or log — see §9.
-6. **The Byzantine repertoire is scripted.** Our attacker equivocates in view 0 or
-   stays silent; it does not lie in later views, vote maliciously, or collude. The
-   demos are experiments confirming specific predictions, not an adversarial search.
-7. **Unbounded view numbers, unbounded `viewchanges` map** — fine for a toy's lifetime.
+   some view eventually outlives the network's true delay (Exercise 7).
+3. **Single-shot.** One decision; no sequence numbers, checkpoints, log, or state
+   transfer — see §9. Consequently no *commit certificate* exists either (§6.5,
+   Exercise 9).
+4. **Crash-atomicity of `persist`.** `File::create` truncates before writing; a crash
+   in that window leaves an empty state file. Real systems write a temp file and
+   atomically rename (Exercise 11). And there is no *proactive recovery* — PBFT's
+   TOCS 2002 second half (periodic reboot + re-keying so undetected compromises age
+   out) is out of scope.
+5. **Canonical serialization by convention.** Signed statements embed `serde_json`
+   output; deterministic for our fixed types, but "canonical bytes for signing" is a
+   real engineering topic (and bug source) that production systems solve explicitly.
+6. **Stringly-typed signatures.** `sig: String` filled by `seal` is a convention, not
+   a type guarantee — nothing statically prevents encoding an unsealed message
+   (Exercise 12 makes illegal states unrepresentable).
+7. **Duplicate NewViews.** Between quorum and its own loopback entry, extra arriving
+   VIEWCHANGEs can re-trigger the leader's broadcast; receivers deduplicate via the
+   `view <= state.view` guard. Harmless chatter, documented rather than guarded.
+8. **The Byzantine repertoire is scripted.** Equivocation, silence, forged
+   certificates, a lying NewView — each a targeted experiment confirming a specific
+   prediction, not an adversarial search over all behaviors; and the demos assert
+   safety, not exhaustively verify it. Model checking is a later course phase.
+9. **Unbounded view numbers, unbounded maps** — fine for a toy's lifetime.
 
 ## 12. Exercises
 
@@ -426,6 +592,20 @@ Honest list; each is a signpost, and the first two are the point of the module:
 8. **MAC-based view changes.** Read §4.5–4.6 of Castro's thesis (or TOCS 2002 §5).
    Explain in one page why replacing signatures with MACs forces the view-change
    protocol to change shape, and summarize the mechanism the thesis adopts instead.
+9. **Commit certificates.** Apply §6.5's rule: add a `Cert`-like object of collected
+   COMMIT signatures and a `prove-decision` stdin command that emits it; write the
+   verifier. Who is "somebody else in another context" here, and what statement must
+   the signatures cover for the proof to be replay-safe across views?
+10. **The step function.** Prove: in every run where some correct process decides,
+    the value coordinate of every correct process's `prepared` field is eventually
+    constant. (This is the lock-in theorem as a data-structure invariant; §6.6.)
+11. **Atomic persistence.** Close limitation 4: write to `pbft-<port>.state.tmp`,
+    `sync_all`, then `rename`. Why is `rename` the operation that makes this atomic,
+    and what does the recovery path do if it finds both files?
+12. **Make illegal states unrepresentable.** Split `Message` into an unsigned type
+    and a `Sealed` wrapper such that `encode` only accepts sealed messages and
+    `seal` is the sole constructor. Which of this module's near-miss bugs does the
+    type system now catch at compile time?
 
 ## Historical and practical notes
 
@@ -508,6 +688,7 @@ Honest list; each is a signpost, and the first two are the point of the module:
 
 ```bash
 cargo build
+cargo run -- keygen 7000 7001 7002 7003   # trusted setup: keys/<port>.sk/.pk (gitignored)
 
 # four terminals (n = 4, f = 1; leader of view 0 is the lowest port):
 cargo run -- 7000 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003
@@ -515,19 +696,28 @@ cargo run -- 7001 127.0.0.1:7000 127.0.0.1:7002 127.0.0.1:7003
 cargo run -- 7002 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7003
 cargo run -- 7003 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002
 
-# on the current view's leader:
+# stdin, on the current view's leader:
 propose lunch            # normal case: everyone decides
 bcast equiv a b          # Byzantine attack: equivocate + withhold (view-0 leader only)
+fakecert evil            # Byzantine insider: claim a forged certificate (any node)
+
+# chaos flags (append to a node's argument list):
+#   --drop-commits       ignore incoming COMMITs (prepared-but-undecided state)
+#   --evil-leader        as new leader, propose 'evil' regardless of the evidence
 ```
 
-Scripted, reproducible experiments (each prints a verdict):
+Nodes persist durable state to `pbft-<port>.state` (gitignored) and recover on
+restart. Scripted, reproducible experiments (each prints a verdict):
 
 ```bash
 cd demos
-python3 happy_path.py             # M1: 4/4 decide, no view change
-python3 equivocation_wedge.py     # M2: no split, no decision — safety without liveness
-python3 view_change_unwedge.py    # M3: rotation + read phase restore liveness
-python3 forged_certificate.py     # the reason Milestone 5 exists
+python3 happy_path.py             # normal case: 4/4 decide, no view change
+python3 equivocation_wedge.py     # safety without liveness: no split, no decision
+python3 view_change_unwedge.py    # NewView entry + fresh proposal restore liveness
+python3 crash_recovery.py         # whole cluster dies; disks remember (fsync!)
+python3 forged_commits.py         # keyless outsider dies at the envelope gate
+python3 forged_certificate.py     # keyed insider dies at verify_cert
+python3 byzantine_new_leader.py   # lying leader deposed; decided value chaperoned
 ```
 
 ---
