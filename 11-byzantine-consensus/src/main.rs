@@ -118,7 +118,7 @@ fn verify_envelope(msg: &Message, pks: &HashMap<String, VerifyingKey>) -> bool {
 
 struct State {
     view: u64,
-    viewchanges: HashMap<String, (u64, Option<Cert>)>, // per sender: the view they want, the certificate they present
+    viewchanges: HashMap<String, (u64, Option<Cert>, String)>, // per sender: the view they want, the certificate they present, the signature
     sentcommit: bool,
     decided: Option<String>,
     preprepared: bool,
@@ -258,6 +258,30 @@ fn load(path: &str) -> Option<Persistent> {
     serde_json::from_str(&data).ok()
 }
 
+fn select_value(
+    viewchanges: &HashMap<String, (u64, Option<Cert>, String)>,
+    nv: u64,
+    pks: &HashMap<String, VerifyingKey>,
+    n: usize,
+    f: usize,
+) -> Option<Cert> {
+    let mut max_prepared: Option<Cert> = None;
+    for (_from, (v, prepared, _)) in viewchanges {
+        if *v == nv {
+            if let Some(cert) = prepared {
+                if !verify_cert(cert, &pks, n, f) {
+                    eprintln!("Invalid certificate from view {}", cert.view);
+                    continue;
+                }
+                if max_prepared.is_none() || cert.view > max_prepared.as_ref().unwrap().view {
+                    max_prepared = Some(cert.clone());
+                }
+            }
+        }
+    }
+    max_prepared
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -306,7 +330,7 @@ fn main() {
         prepared: disk.as_ref().and_then(|p| p.prepared.clone()),
         prepares: HashMap::new(),
         commits: HashMap::new(),
-        highest_vc_sent: 0, 
+        highest_vc_sent: 0,
         view_entered: Instant::now(),
     };
 
@@ -381,12 +405,11 @@ fn main() {
                         let fake = Cert {
                             view: nv - 1,
                             value: m.to_string(),
-                            sigs: nodes
-                                .iter()
-                                .map(|a| (a.clone(), "00".repeat(64)))
-                                .collect(),
+                            sigs: nodes.iter().map(|a| (a.clone(), "00".repeat(64))).collect(),
                         };
-                        eprintln!("INSIDER: claiming forged certificate for '{m}' in my VIEWCHANGE");
+                        eprintln!(
+                            "INSIDER: claiming forged certificate for '{m}' in my VIEWCHANGE"
+                        );
                         broadcast(
                             &peers,
                             &me,
@@ -416,8 +439,7 @@ fn main() {
             thread::sleep(Duration::from_millis(500));
             let fire = {
                 let mut s = state.lock().unwrap();
-                if s.decided.is_none() && s.view_entered.elapsed() > timeout
-                {
+                if s.decided.is_none() && s.view_entered.elapsed() > timeout {
                     let target = s.view.max(s.highest_vc_sent) + 1;
                     s.highest_vc_sent = target;
                     s.view_entered = Instant::now();
@@ -451,8 +473,6 @@ fn main() {
             continue;
         }
         if let Some(msg) = decode(&line) {
-            // The authentication gate: one check protecting every arm below.
-            // Past this line, `from` fields are trustworthy identities.
             if !verify_envelope(&msg, &pks) {
                 let from = match &msg {
                     Message::PrePrepare { from, .. }
@@ -468,7 +488,9 @@ fn main() {
                     from, view: v, m, ..
                 } => {
                     let mut state = state.lock().unwrap();
-                    if from == leader_of(state.view, &nodes) && v == state.view && !state.preprepared
+                    if from == leader_of(state.view, &nodes)
+                        && v == state.view
+                        && !state.preprepared
                     {
                         state.preprepared = true;
                         state.my_prepare = Some((v, m.clone()));
@@ -541,18 +563,23 @@ fn main() {
                     from,
                     newview: nv,
                     prepared,
-                    ..
+                    sig,
                 } => {
                     let mut state = state.lock().unwrap();
-                    let entry = state
-                        .viewchanges
-                        .entry(from)
-                        .or_insert((nv, prepared.clone()));
+                    let entry = state.viewchanges.entry(from).or_insert((
+                        nv,
+                        prepared.clone(),
+                        sig.clone(),
+                    ));
                     if nv > entry.0 {
-                        *entry = (nv, prepared);
+                        *entry = (nv, prepared, sig.clone());
                     }
 
-                    let count = state.viewchanges.values().filter(|(v, _)| *v == nv).count();
+                    let count = state
+                        .viewchanges
+                        .values()
+                        .filter(|(v, _, _)| *v == nv)
+                        .count();
                     if count >= f + 1 && nv > state.highest_vc_sent && nv > state.view {
                         state.highest_vc_sent = nv;
                         broadcast(
@@ -577,22 +604,7 @@ fn main() {
                         persist(&state, &state_path);
                         eprintln!("ENTERED VIEW {}", nv);
                         if leader_of(nv, &nodes) == me {
-                            let mut max_prepared: Option<Cert> = None;
-                            for (_from, (v, prepared)) in &state.viewchanges {
-                                if *v == nv {
-                                    if let Some(cert) = prepared {
-                                        if !verify_cert(cert, &pks, n, f) {
-                                            eprintln!("Invalid certificate from view {}", cert.view);
-                                            continue;
-                                        }
-                                        if max_prepared.is_none()
-                                            || cert.view > max_prepared.as_ref().unwrap().view
-                                        {
-                                            max_prepared = Some(cert.clone());
-                                        }
-                                    }
-                                }
-                            }
+                            let max_prepared = select_value(&state.viewchanges, nv, &pks, n,f);
                             if let Some(cert) = max_prepared {
                                 eprintln!(
                                     "Leader {} adopting prepared value from view {}: {}",
