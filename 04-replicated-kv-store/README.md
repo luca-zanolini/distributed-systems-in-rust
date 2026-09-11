@@ -11,7 +11,8 @@ propagated to a majority **quorum**, reads consult a quorum and return the value
 timestamp, and correctness rests on the fact that any two majorities intersect. Along the way the
 module demonstrates — experimentally, not only in statement — the tension between consistency and
 availability formalized by the **CAP theorem**, and the **crash-recovery** model with state
-transfer. The register this module completes is the strongest object obtainable *without*
+transfer. The register abstraction this module builds toward — culminating in the atomic
+register of Exercise 3 — is the strongest object obtainable *without*
 agreement; the questions it provably leaves open (who is the writer? who succeeds a failed
 writer? what order do concurrent writes take?) motivate Modules 05 and 07.
 
@@ -68,7 +69,8 @@ consensus-backed replication (etcd, ZooKeeper, Spanner, CockroachDB), and log-sh
 
 ## 3. The abstraction: a (1, N) regular register
 
-**Specification (regular register; CCGR §4.1.2, adapted).** One designated process may invoke
+**Specification (regular register; CCGR §4.2.1, Module 4.1, adapted; §4.1.2 surveys the
+safe/regular/atomic hierarchy).** One designated process may invoke
 `write(v)`; any process may invoke `read()`. Assuming the writer invokes operations
 sequentially:
 
@@ -91,11 +93,15 @@ one writer means no ties, which is exactly what "(1, N)" buys; multiple writers 
 timestamp pairs or vector clocks).
 
 - **Write(k, v).** The primary increments the timestamp for `k`, applies `(ts, v)` locally,
-  sends `repl ts k v` to all replicas, and completes when a **write quorum** `W = ⌊N/2⌋ + 1`
-  of nodes (counting itself) has acknowledged.
-- **Read(k).** The reading coordinator queries all nodes for their `(ts, value)` pair for `k`,
-  waits for a **read quorum** `R = ⌊N/2⌋ + 1` of replies (counting its own copy), and returns
-  the value with the **highest timestamp**.
+  sends `repl ts k v` to all replicas (sequentially, each attempt bounded by a timeout), then
+  counts acknowledgments and succeeds iff a **write quorum** `W = ⌊N/2⌋ + 1` of nodes
+  (counting itself) acked. (CCGR's Alg. 4.2 returns *as soon as* a quorum acks; contacting
+  all-then-counting is behaviorally equivalent under crash-stop but pays the slow-minority
+  latency — a disclosed simplification.)
+- **Read(k).** The reading coordinator queries all nodes for their `(ts, value)` pair for `k`
+  (same bounded, sequential fan-out), counts replies against a **read quorum**
+  `R = ⌊N/2⌋ + 1` (counting its own copy), and returns the value with the
+  **highest timestamp**.
 
 **Lemma (quorum intersection).** Any two subsets `Q₁, Q₂ ⊆ Π` with `|Q₁|, |Q₂| ≥ ⌊N/2⌋ + 1`
 satisfy `Q₁ ∩ Q₂ ≠ ∅`.
@@ -106,8 +112,9 @@ before a read begins. Its write quorum `Q_w` holds `(t, v)`. The read's quorum `
 `Q_w`, so the read receives at least one reply with timestamp ≥ `t`; timestamps grow only through
 the single writer, so any strictly larger timestamp belongs to a concurrent write. Taking the
 maximum-timestamp reply therefore returns the last completed or a concurrent write — RR2.
-Termination (RR1) holds because at most `f ≤ ⌊N/2⌋` nodes crash, so a quorum of correct nodes
-always exists and eventually replies. ∎
+Termination (RR1) holds because at most `f ≤ ⌊(N−1)/2⌋` nodes crash (the §2 assumption
+`N ≥ 2f + 1`), so a quorum of correct nodes always exists and — each attempt being bounded by
+a timeout — eventually replies. ∎
 
 Majority voting is the symmetric point (`R = W = ⌊N/2⌋+1`) of the general condition
 **`R + W > N`**, whose two extremes are instructive: *read-one/write-all* (`R = 1, W = N`;
@@ -153,10 +160,12 @@ register additionally requires that once some read returns a value, no later rea
 older one — ruling out the new-then-old anomaly among reads concurrent with a write. The standard
 repair is **read-impose** ("write-back", CCGR §4.3): before returning, a reader writes the
 winning `(ts, v)` back to a quorum, ensuring every subsequent quorum intersects a set that has
-seen it. This implementation deliberately omits the write-back; Exercise 3 adds it. The general
-result that single-register reads and writes — but *not* arbitrary read-modify-write objects —
-are implementable wait-free in asynchronous crash-prone systems is due to Attiya, Bar-Noy and
-Dolev (the **ABD** algorithm), which majority voting closely follows.
+seen it. This implementation deliberately omits the write-back; Exercise 3 adds it. That
+single-register reads and writes are implementable wait-free in asynchronous crash-prone
+systems (with a correct majority) is due to Attiya, Bar-Noy and Dolev (the **ABD**
+algorithm), which majority voting closely follows; that arbitrary read-modify-write objects
+are *not* so implementable follows from Herlihy's consensus hierarchy (and, for
+message-passing, FLP) — a different result, often misattributed.
 
 ## 7. Correspondence between theory and code
 
@@ -189,6 +198,12 @@ Wire protocol (newline-framed): `set k v` / `get k` / `remove k` (client);
   them. Durable acknowledgment requires logging to stable storage first. *(→ CCGR §4.5;
   Modules 07–08.)*
 - **Regular, not atomic.** No read-impose. *(→ Exercise 3.)*
+- **Membership is per-node configuration.** Each node computes quorum denominators from its
+  *own* peer list; nothing validates that all nodes were launched with the same Π. Quorum
+  intersection (§4) holds only under symmetric configuration — a node launched with a short
+  peer list would serve reads under a trivially satisfied "quorum". The demos deliberately
+  run some backups with empty peer lists (their `get`s are local inspections, not quorum
+  reads).
 - **No agreement.** Ordering concurrent operations, all-or-nothing multi-node writes, and
   writer succession all require consensus or atomic commit. *(→ Modules 05–08.)*
 
@@ -256,7 +271,8 @@ cargo run -- 4002 127.0.0.1:4000 127.0.0.1:4001
 ```
 Interact via the bundled client (`cargo run --bin client`); restart a crashed node with
 `--catch-up 127.0.0.1:4000` so it performs state transfer before serving. The `demos/` scripts
-drive the three experiments of §5 against real sockets.
+drive experiments (ii) and (iii) of §5 plus the M5 recovery scenario against real sockets;
+experiment (i) can be reproduced manually with a one-backup cluster.
 
 ---
 *[Course home](../) · Previous: [Module 03 (planned)](../03-shared-memory-concurrency/) · Next:

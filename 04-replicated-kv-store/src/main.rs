@@ -27,7 +27,14 @@ impl Store {
 
     // Store a versioned value. Timestamp chosen by the CALLER (the primary).
     fn write(&mut self, key: String, ts: u64, value: String) {
-        self.map.insert(key, (ts, value));
+        // Alg 4.2's guard: apply only if the incoming timestamp is NEWER than what
+        // we hold — reordered replication messages must never regress a value.
+        match self.map.get(&key) {
+            Some((old_ts, _)) if *old_ts >= ts => {}
+            _ => {
+                self.map.insert(key, (ts, value));
+            }
+        }
     }
 
     // Read the versioned value, OWNED (cloned) so a read-quorum can freely collect
@@ -42,7 +49,11 @@ impl Store {
 }
 
 fn forward(addr: &str, line: &str) -> std::io::Result<String> {
-    let mut b = TcpStream::connect(addr)?;
+    let sa: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad addr"))?;
+    let mut b = TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(500))?;
+    b.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
     b.write_all(line.as_bytes())?;
     b.write_all(b"\n")?;
     let mut ack = String::new();
@@ -53,7 +64,11 @@ fn forward(addr: &str, line: &str) -> std::io::Result<String> {
 // Ask a replica for its versioned value of `key`: Ok(Some((ts,value))) if it has it,
 // Ok(None) if absent, Err if unreachable.
 fn read_from(addr: &str, key: &str) -> std::io::Result<Option<(u64, String)>> {
-    let mut conn = TcpStream::connect(addr)?;
+    let sa: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad addr"))?;
+    let mut conn = TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(500))?;
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
     conn.write_all(format!("readts {key}\n").as_bytes())?;
     let mut reply = String::new();
     BufReader::new(&conn).read_line(&mut reply)?;
@@ -98,6 +113,12 @@ fn handle_client(
             }
             // INTERNAL verb: a versioned write forwarded by the primary (also the line
             // format `dump` emits). A replica applies it and does NOT re-replicate.
+            // INTERNAL verb: a deletion forwarded by the primary. Terminal — a
+            // replica applies it and does NOT re-replicate.
+            ["replrm", key] => {
+                store.lock().unwrap().remove(key);
+                "OK\n".to_string()
+            }
             ["repl", ts, key, rest @ ..] => {
                 let ts: u64 = ts.parse().unwrap_or(0);
                 store
@@ -153,7 +174,10 @@ fn handle_client(
             ["remove", key] => {
                 // Best-effort: remove is NOT yet versioned (tombstones deferred), so a
                 // stale replica could resurrect the key under a quorum read. A follow-up.
-                to_replicate = Some(format!("remove {key}"));
+                // Replicated as the TERMINAL internal verb `replrm` — replicating the
+                // client verb `remove` would make each replica re-forward it: an
+                // unbounded replication storm in a full-mesh peer configuration.
+                to_replicate = Some(format!("replrm {key}"));
                 match store.lock().unwrap().remove(key) {
                     Some(_) => "OK\n".to_string(),
                     None => "Key not found\n".to_string(),
@@ -213,7 +237,7 @@ fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?; // claim the port, start listening
 
     let store = Arc::new(Mutex::new(Store::new())); // shared, lockable store
-    // Catch-up (anti-entropy): a recovering node pulls a full snapshot before it serves.
+    // Catch-up (state transfer): a recovering node pulls a full snapshot before it serves.
     if let Some(primary) = &catch_up {
         println!("catching up from {primary} ...");
         let mut conn = TcpStream::connect(primary)?; // open a connection (just like forward())

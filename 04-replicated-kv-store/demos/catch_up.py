@@ -1,4 +1,4 @@
-"""Catch-up / anti-entropy: a crashed node restarts empty, then --catch-up makes it converge."""
+"""Catch-up / state transfer: a crashed node restarts empty, then --catch-up makes it converge."""
 import os, socket, subprocess, time
 
 BIN = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "target", "debug", "replicated-kv-store"))
