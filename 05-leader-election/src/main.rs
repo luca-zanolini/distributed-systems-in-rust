@@ -24,6 +24,15 @@ fn main() -> std::io::Result<()> {
     // shared: when did we last hear from each peer?
     let last_heard: Arc<Mutex<HashMap<String, (Instant, String)>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    // Seed every peer as "heard at startup": a peer that never comes up must
+    // still be suspected once the timeout passes (strong completeness, EPFD1) —
+    // otherwise a never-heard node is trusted forever and, if it has the lowest
+    // port, wedges the election permanently.
+    if let Ok(mut map) = last_heard.lock() {
+        for p in &peers {
+            map.insert(p.clone(), (Instant::now(), String::new()));
+        }
+    }
     // heartbeat + monitor thread
     {
         let me = me.clone();
@@ -62,7 +71,12 @@ fn main() -> std::io::Result<()> {
                 let choice = candidates.into_iter().min_by_key(|a| port_of(a)).unwrap();
 
                 for addr in &peers {
-                    if let Ok(mut s) = TcpStream::connect(addr) {
+                    // Bounded connect: an unreachable (not just dead) peer must
+                    // not stall our own heartbeat loop past the timing analysis.
+                    let Ok(sa) = addr.parse() else { continue };
+                    if let Ok(mut s) =
+                        TcpStream::connect_timeout(&sa, Duration::from_millis(200))
+                    {
                         let _ = writeln!(s, "ping {me} {choice}");
                     }
                 }
@@ -83,7 +97,7 @@ fn main() -> std::io::Result<()> {
                     count
                 };
 
-                let status = if votes >= majority {
+                let status = if choice == me && votes >= majority {
                     format!("I AM LEADER ({votes}/{total} votes)")
                 } else if choice == me {
                     format!("candidate, NO majority ({votes}/{total} votes) — standing down")
@@ -106,6 +120,9 @@ fn main() -> std::io::Result<()> {
         let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?;
         for stream in listener.incoming() {
             if let Ok(stream) = stream {
+                // Bounded read: a client that connects and sends nothing must
+                // not halt inbound heartbeat processing.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
                 if reader.read_line(&mut line).is_ok() {

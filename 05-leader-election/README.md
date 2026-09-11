@@ -150,8 +150,9 @@ of the strongest **failure detector** implementable in it:
 | Asynchronous | none of the above | not deterministically — FLP |
 
 The two columns are linked by a fundamental result: **Ω is the weakest failure detector for
-consensus** given a correct majority (Chandra–Hadzilacos–Toueg 1996; without the majority
-assumption, the pair (Σ, Ω) is weakest, where Σ is the quorum detector). Partial synchrony is
+consensus** given a correct majority (Chandra–Hadzilacos–Toueg 1996). Without the majority
+assumption, the pair (Σ, Ω) is weakest, where Σ is the quorum detector — a later result due
+to Delporte-Gallet, Fauconnier & Guerraoui (PODC 2004; JACM 2010). Partial synchrony is
 *sufficient* to implement Ω — in fact strictly weaker timing assumptions suffice — and Ω, with a
 majority, suffices for consensus. This module implements Ω; Module 07 consumes it. A fuller
 treatment, including why the failure-detector interface does not extend to Byzantine faults, is
@@ -185,6 +186,10 @@ delayed heartbeat produces a false suspicion. Node identifiers are compared nume
   that becomes Raft. *(→ Module 07.)*
 - **Fixed timeout.** Production detectors adapt to measured network behavior (e.g. the
   φ-accrual detector); a fixed 3 s trades false suspicions against detection latency bluntly.
+  More precisely: a *fixed* timeout realizes ◇P only if the (unknown) eventual delay bound
+  happens to fit under it — effectively a known-bound assumption. CCGR's Algorithm 2.7
+  ("Increasing Timeout") grows the timeout on every false suspicion precisely to discharge
+  that assumption; see Exercise 1.
 - **Static membership.** The peer set is fixed at launch; joining, leaving, and discovery are
   membership problems (gossip, SWIM).
 - **Crashes are simulated by killing processes.** A true network partition (all processes up,
@@ -224,6 +229,8 @@ delayed heartbeat produces a false suspicion. Node identifiers are compared nume
   JACM 43(2), 1996.
 - T. D. Chandra, V. Hadzilacos, S. Toueg, *The Weakest Failure Detector for Solving Consensus*,
   JACM 43(4), 1996.
+- C. Delporte-Gallet, H. Fauconnier, R. Guerraoui, *Tight Failure Detection Bounds on Atomic
+  Object Implementations*, JACM 57(4), 2010 (earlier version PODC 2004). — The (Σ, Ω) result.
 - C. Dwork, N. Lynch, L. Stockmeyer, *Consensus in the Presence of Partial Synchrony*,
   JACM 35(2), 1988.
 - M. Fischer, N. Lynch, M. Paterson, *Impossibility of Distributed Consensus with One Faulty
