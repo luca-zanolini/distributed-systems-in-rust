@@ -274,7 +274,7 @@ fn main() {
                     let mut state = state.lock().unwrap();
                     state.echos.entry(from).or_insert(m.clone());
                     let count = state.echos.values().filter(|v| **v == m).count();
-                    if count > (n + f) / 2 && !state.sentready {
+                    if 2 * count > n + f && !state.sentready {
                         state.sentready = true;
                         broadcast(
                             &peers,
@@ -292,7 +292,7 @@ fn main() {
                     let mut state = state.lock().unwrap();
                     state.readys.entry(from).or_insert(m.clone());
                     let count = state.readys.values().filter(|v| **v == m).count();
-                    if count >= f + 1 && !state.sentready {
+                    if count > f && !state.sentready {
                         state.sentready = true;
                         broadcast(
                             &peers,
@@ -305,7 +305,7 @@ fn main() {
                             &sk,
                         );
                     }
-                    if count > (n + f) / 2 && !state.delivered {
+                    if count > 2 * f && !state.delivered {
                         state.delivered = true;
                         eprintln!("Delivered message: {}", m);
                     }

@@ -270,15 +270,26 @@ weaker primitive of §4.
 
 ### 5.3 Correctness
 
-**Consistency (BRB4).** A correct process sends READY for `m` only on an **echo quorum**: a set
-`E` with `|E| > (N+f)/2`. Two such sets `E, E′` satisfy
+**Consistency (BRB4).** A correct process sends READY for `m` by one of *two* rules — an
+**echo quorum** (`> (N+f)/2` matching ECHOs) or **amplification** (`> f` matching READYs) —
+so the argument needs two steps, not one.
+
+*Step 1: the first correct READY (for any value, in any execution order) arises from an echo
+quorum.* Suppose instead it arose by amplification: its sender saw `> f` READYs for the value,
+and since at most `f` processes are faulty, at least one of those came from a correct process —
+an *earlier* correct READY, contradicting firstness. So amplification can never bootstrap
+READYs out of nothing; some correct process paid the echo-quorum price first.
+
+*Step 2: all echo quorums certify the same value.* Two echo quorums `E, E′` satisfy
 `|E ∩ E′| > (N+f)/2 + (N+f)/2 − N = f`, so their intersection contains a **correct** process —
-which echoed *one* value. Hence all echo quorums certify the same value, all correct READYs
-carry it, and two correct deliveries cannot differ. This is Module 04's quorum intersection
-with a Byzantine twist: the overlap must exceed `f` so that at least one member is *honest* —
-the reason the quorum is a supermajority (`> (N+f)/2`) rather than a majority, and the origin
-of `N > 3f`. Sets with this pairwise-honest-intersection property are **Byzantine quorums**
-(CCGR §2.7.3; Malkhi–Reiter 1998).
+which echoed *one* value. Hence every quorum-triggered correct READY carries the same value;
+and every amplification-triggered correct READY inherits it, since its `> f` witnesses include
+a correct earlier READY sender (induction on the order in which correct processes first send
+READY). All correct READYs carry one value, so two correct deliveries cannot differ. This is
+Module 04's quorum intersection with a Byzantine twist: the overlap must exceed `f` so that at
+least one member is *honest* — the reason the quorum is a supermajority (`> (N+f)/2`) rather
+than a majority, and the origin of `N > 3f`. Sets with this pairwise-honest-intersection
+property are **Byzantine quorums** (CCGR §2.7.3; Malkhi–Reiter 1998).
 
 **Validity (BRB1).** A correct sender's `m` is echoed by all `≥ N − f` correct processes, and
 `N − f > (N+f)/2` because `N > 3f`; every correct process reaches the echo quorum, sends READY,
@@ -357,7 +368,8 @@ says "the sender showed *me* this value," a READY says "*I* saw a quorum" — an
 forwards another's message. That is why the protocol is signature-free *in principle*, and why
 its cost is `O(N²)`: **all-to-all gossip is the price of non-transferable knowledge**. When a
 protocol does exploit transferability, its shape changes: in *Signed Echo Broadcast*
-(CCGR Alg. 3.17) the sender collects `2f+1` signed echoes into a forwardable bundle — a
+(CCGR Alg. 3.17) the sender collects a Byzantine quorum (`> (N+f)/2`; `2f+1` at
+`N = 3f+1`) of signed echoes into a forwardable bundle — a
 **certificate**, knowledge made portable — and the all-to-all round disappears (`O(N)`
 messages, one certificate). Every certificate in a protocol marks a spot where transferability
 is being spent; Module 11's view change is the load-bearing example, and HotStuff is the design
@@ -369,7 +381,8 @@ with Module 11, where the same primitive *is* used transferably. Two consequence
 noting:
 
 1. **The structure of Bracha is untouched by the choice.** Thresholds, tallies, amplification —
-   byte-for-byte identical with MACs, with signatures, or (as the code stood before this layer)
+   identical in threshold and tally logic with MACs, with signatures, or (as the code stood
+   before this layer)
    with blind trust. Authentication is a layer *below* the protocol; the arms above the gate
    never changed. (One small code-shape difference had we used MACs: a MAC is per recipient-pair,
    so `seal` would move inside the per-peer send loop and compute `N` tags per broadcast; a
@@ -409,7 +422,7 @@ one node down (`N > 3f` at work).
 | Concept | Realization (`src/main.rs`) |
 |---|---|
 | designated sender `s`, known a priori | `--sender <addr>` on every node; SEND accepted only if `from == sender` |
-| authenticated links (assumed) | trusted `from` field on each message (§6, §9) |
+| authenticated links (implemented) | `seal`/`verify_envelope` over the domain-separated statement; unauthenticated messages dropped at the gate (§6.5) |
 | per-identity, first-testimony-only counting | `echos`/`readys`: `HashMap<from, value>` + `entry().or_insert()` |
 | echo quorum `> (N+f)/2` → READY | `2 * count > n + f` in the `Echo` arm |
 | amplification `> f` → READY | `count > f` in the `Ready` arm |
@@ -441,6 +454,17 @@ one node down (`N > 3f` at work).
   replaceable role; with a faulty sender, delivering nothing is a correct outcome, so nothing
   must be rescued. Module 11 adds the obligation to make *progress* despite a faulty leader —
   the obligation that summons the view change.
+- **The listener is trivially stallable.** Connections are processed one at a time and
+  `read_line` blocks without a timeout, so any peer — or any keyless socket — that connects
+  and never sends a newline halts the node: the cheapest possible denial of service, at the
+  transport layer rather than the protocol layer. A production node reads concurrently with
+  timeouts; the protocol above is unaffected either way.
+- **Signed statements are not instance-bound.** The statement `ECHO:{m}` binds message type
+  and value but not the broadcast instance; CCGR (discussion of Alg. 3.17) warns explicitly
+  that the instance identifier must be folded into the signed statement, else a Byzantine
+  process can replay a correct process's signature in a different context. Harmless in this
+  single-shot lab; a multi-instance extension (keyed by `(sender, seq)`, as above) must sign
+  `ECHO:{sender}:{seq}:{m}`.
 - **Bandwidth.** Every process retransmits the full message in every ECHO/READY; for large `m`,
   erasure-coded variants disseminate fragments plus a digest (Cachin–Tessaro's verifiable
   information dispersal; HoneyBadger's RBC) at a fraction of the bandwidth.
@@ -448,7 +472,8 @@ one node down (`N > 3f` at work).
 ## 10. Exercises
 
 1. **(The identity assumption is load-bearing.)** The protocol tolerates `f = 1` for `N = 4`.
-   Show that with unauthenticated `from` fields (plain TCP, as in the lab), a *single*
+   Show that with unauthenticated `from` fields (plain TCP, as the lab stood before §6.5's
+   layer — `demos/forged_ready.py` re-stages exactly this), a *single*
    Byzantine process can violate consistency, and name the exact counting step it subverts.
 2. **(Threshold necessity.)** Give an execution with `N = 4, f = 1` in which lowering the echo
    quorum from 3 to 2 lets an equivocating sender make two correct processes deliver different
@@ -480,7 +505,7 @@ ideas of this module and its neighbors.)*
 
 - **Why "Byzantine."** Lamport recounts that the fault model was nearly named after a
   different nation: wanting generals of a nationality that would offend no reader, he first
-  titled the paper *The Albanian Generals Problem* (Albania then being a closed society);
+  made the generals Albanian (Albania then being a closed society);
   Jack Goldberg pointed out that Albanians abroad might reasonably object, and the safely
   extinct Byzantines were chosen instead (Lamport, notes to *My Writings*). The `3f + 1`
   bound itself predates the story: it appears in Pease–Shostak–Lamport (JACM 1980), formulated
@@ -534,9 +559,9 @@ ideas of this module and its neighbors.)*
   CCGR §2.4.6, implementable with MACs; the book's chapter notes observe that TLS or SSH
   tunnels provide the abstraction in practice — and that for authentication alone, *encryption
   is not needed and might be turned off for performance*. In blockchains the validator's
-  signing key doubles as its identity. The lab simplification — trusting a self-declared
-  sender field on localhost — is exactly the gap a MAC would close, and it is called out as an
-  honest limit above.
+  signing key doubles as its identity. The pre-layer lab trusted a self-declared sender field
+  on localhost — exactly the gap the §6.5 layer (or a MAC) closes; `demos/forged_ready.py`
+  re-stages that gap as an attack and watches it die at the gate.
 
 ## References
 
@@ -581,7 +606,8 @@ cargo run -- 6002 127.0.0.1:6000 127.0.0.1:6001 127.0.0.1:6003 --sender 127.0.0.
 cargo run -- 6003 127.0.0.1:6000 127.0.0.1:6001 127.0.0.1:6002 --sender 127.0.0.1:6000
 ```
 In the **sender's** terminal, `bcast hello` broadcasts honestly; `bcast equiv attack retreat`
-equivocates (one half of the peers hears `attack`, the other `retreat`). Nodes log protocol
+equivocates (with three peers, one hears `attack`, two hear `retreat`; the sender's own node
+receives both and echoes whichever arrives first). Nodes log protocol
 events to standard error. The `demos/` scripts reproduce the experiments of §7 (they drive the
 sender's stdin through `subprocess`, which is more reliable than a shell pipeline).
 
