@@ -3,7 +3,7 @@
 *Part of **Concurrent and Distributed Systems in Rust** ([course home](../)). Companion:
 [CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENCY.md). The implementation this
 document accompanies is [Module 07 (Raft)](README.md); it is also referenced from Modules 04,
-04, and 06.*
+05, and 06.*
 
 **Abstract.** These notes map the theory of distributed agreement: the consensus specification;
 the FLP impossibility and the two principled ways around it; timing models and their
@@ -107,7 +107,8 @@ Module 05 states the specifications formally. The correspondence:
 **Theorem (Chandra–Hadzilacos–Toueg 1996).** Ω is the *weakest* failure detector that solves
 consensus, given a majority of correct processes (`f < n/2`). Without the majority assumption,
 the weakest is the pair (Σ, Ω), where Σ — the quorum detector — supplies the intersecting-set
-structure that a majority otherwise provides.
+structure that a majority otherwise provides (a later result, due to
+Delporte-Gallet–Fauconnier–Guerraoui, 2004/2010).
 
 Consequently, with a correct majority: consensus is solvable iff Ω is implementable; and since
 partial synchrony suffices for Ω (but is not necessary — §2), the timing lens and the detector
@@ -202,7 +203,7 @@ footnote.
 
 ## 8. Consensus is not atomic commitment
 
-**Atomic commitment** (Module 08; CCGR §6.1) resembles consensus — all processes must reach one
+**Atomic commitment** (Module 08; CCGR §6.6) resembles consensus — all processes must reach one
 decision — but differs in both defining dimensions:
 
 - **Decision function.** Consensus may decide any proposed value (C2). Atomic commitment's
@@ -213,9 +214,13 @@ decision — but differs in both defining dimensions:
   unable to terminate (demonstrated end-to-end in Module 08).
 
 The failure-detector hierarchy makes the difference precise: consensus requires Ω (with a
-majority), while non-blocking atomic commitment in general requires the **perfect** detector P
-— deciding COMMIT requires *certainty* that no participant has crashed, which no
-eventually-accurate detector supplies. In this exact sense NBAC is the harder problem, and the
+majority), while non-blocking atomic commitment needs *accurate* crash detection: with a vote
+missing, termination forces a decision, the only valid one is ABORT — and abort-validity
+permits it only if some participant voted NO or *actually crashed*, so a false suspicion
+would produce an invalid ABORT. No eventually-accurate detector supplies that accuracy. CCGR
+solves NBAC from consensus plus the **perfect** detector P; P is sufficient but not necessary
+(the weakest detector is strictly weaker — anonymous crash detection; Guerraoui 2002,
+Delporte-Gallet et al. 2004). In this exact sense NBAC is the harder problem, and the
 practical repair is to *reuse* consensus rather than avoid it: **Paxos Commit**
 (Gray–Lamport 2006) runs the commit decision through a consensus instance, eliminating the
 single point of blocking; 2PC is its one-acceptor degenerate case. Layered architectures
@@ -247,11 +252,11 @@ arithmetic that provides safety necessarily withholds service from minorities.
 | [01](../01-kv-store/), [02](../02-networked-kv-store/) | pre-agreement: the register; processes, links, local concurrency |
 | [04](../04-replicated-kv-store/) | the (1, N) majority-quorum register — what is achievable *without* consensus, and what is not |
 | [05](../05-leader-election/) | ◇P and Ω from heartbeats — partial synchrony, packaged |
-| [06](../06-logical-time-broadcast/) (planned) | logical time and the broadcast hierarchy; total-order broadcast ⟺ consensus |
+| [06](../06-logical-time-broadcast/) | logical time and the broadcast hierarchy (Part I built); total-order broadcast ⟺ consensus (Part II planned) |
 | [07](README.md) | crash consensus (Raft): uniform agreement, majority quorums, crash-recovery |
 | [08](../08-two-phase-commit/) | atomic commitment (2PC): unanimity, blocking, the P-vs-Ω separation |
-| [10](../10-byzantine-broadcast/) (planned) | **Byzantine reliable broadcast** (Bracha): `3f+1`, echo/ready quorum amplification — the first Byzantine primitive |
-| [11](../11-byzantine-consensus/) (planned) | **Byzantine consensus** (PBFT-style): two-phase voting, certificates, view-change |
+| [10](../10-byzantine-broadcast/) | **Byzantine reliable broadcast** (Bracha): `3f+1`, echo/ready quorum amplification, authenticated envelopes — the first Byzantine primitive |
+| [11](../11-byzantine-consensus/) | **Byzantine consensus** (PBFT-style): signed certificates, NEW-VIEW as verifiable conditional collect, stable storage, view-change |
 
 (Modules [03](../03-shared-memory-concurrency/), [09](../09-concurrency-control/), and
 [12](../12-crdts-eventual-consistency/) — shared-memory concurrency, concurrency control, and
@@ -291,7 +296,7 @@ eventual consistency/CRDTs — sit off this map's agreement axis; see the
 - D. Dolev, H. R. Strong, *Authenticated Algorithms for Byzantine Agreement*, SIAM J.
   Computing 12(4), 1983.
 - G. Bracha, *Asynchronous Byzantine Agreement Protocols*, Information and Computation 75(2),
-  1987. (Reliable broadcast — Module 07.)
+  1987. (Reliable broadcast — Module 10.)
 - M. Castro, B. Liskov, *Practical Byzantine Fault Tolerance*, OSDI 1999.
 - M. Yin, D. Malkhi, M. K. Reiter, G. Gueta, I. Abraham, *HotStuff: BFT Consensus with
   Linearity and Responsiveness*, PODC 2019.
