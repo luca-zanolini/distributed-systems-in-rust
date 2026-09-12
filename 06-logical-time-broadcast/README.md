@@ -94,8 +94,14 @@ despite crashes (§3)? how do we *timestamp* events respecting `→` (§4–§5)
 **Algorithm (Eager Reliable Broadcast; CCGR Alg. 3.3).** On first delivery of a message:
 deliver it, then **re-broadcast it**. No failure detector, no timing assumption; if the origin
 crashed mid-fan-out, whoever received the message relays it to everyone. Dedup by
-`(origin, m)`. Cost: `O(N²)` messages per broadcast. `demos/crash_relay.py` kills the origin
-~50 ms after it broadcasts; every survivor delivers anyway — RB4 observed.
+`(origin, seq)` — the sender's per-origin sequence number, which already rides in the causal
+stamp (keying on the *payload* would silently drop a repeated payload while the sender's
+counter advanced, permanently wedging that origin's causal stream; a defect found by
+adversarial review). Cost: `O(N²)` messages per broadcast. `demos/crash_relay.py` kills the
+origin ~50 ms after it broadcasts; every survivor delivers — RB4 observed. (Honesty note: on
+loopback the origin's own fan-out completes in ~1 ms, so this run does not *isolate* the
+relay mechanism — the survivors hold direct copies; isolating the relay would require
+suppressing part of the origin's fan-out.)
 
 Note that **RB4 is a liveness property** (CCGR §3.3.1): it can always be satisfied by
 extensions of a finite execution. Nothing about the *content* of deliveries can go irreparably
@@ -151,7 +157,7 @@ between concurrent events it is arbitrary — and no one can tell which parts ar
 maintenance are best stated as an invariant rather than a rule list:
 
 > **Lemma (history inventory).** For any event `e′` and process `p`: `VC(e′)[p]` equals the
-> number of `p`'s events in the causal past of `e′`.
+> number of `p`'s events in the causal past of `e′` (inclusive of `e′` itself).
 >
 > *Proof sketch.* Values of `p`'s counter reach other processes **only inside messages** (the
 > receiver's max-merge), so a value `k` at `e′` traces back, hop by causal hop, to `p`'s `k`-th
@@ -162,7 +168,8 @@ maintenance are best stated as an invariant rather than a rule list:
 strict). The forward direction is monotonicity along causal paths, as for Lamport clocks. The
 converse — the direction Lamport clocks lack — follows from the lemma: if `e` is `p`'s `k`-th
 event and `VC(e′)[p] ≥ k`, then `p`'s `k`-th event, i.e. `e`, is in `e′`'s causal past. In
-practice one checks a **single component**: `e → e′  ⟺  VC(e)[origin(e)] ≤ VC(e′)[origin(e)]`.
+practice one checks a **single component**: for distinct events `e ≠ e′`,
+`e → e′  ⟺  VC(e)[origin(e)] ≤ VC(e′)[origin(e)]`.
 
 **Concurrency becomes provable.** If `VC(e)` and `VC(e′)` are *incomparable* — each has some
 strictly larger entry — then by the theorem neither `e → e′` nor `e′ → e`: the events are
@@ -212,8 +219,10 @@ rule and the delivery test must be a matched pair.** (Stamp after incrementing b
 
 **Specification (causal-order reliable broadcast; CCGR Module 3.9).** RB1–RB4, plus:
 
-- **CRB5 (Causal delivery).** If `broadcast(m₁) → broadcast(m₂)`, then no correct process
-  delivers `m₂` unless it has already delivered `m₁`.
+- **CRB5 (Causal delivery).** If `broadcast(m₁) → broadcast(m₂)`, then no process
+  delivers `m₂` unless it has already delivered `m₁`. (CCGR states this for *all* processes,
+  not just correct ones — a per-process safety property — and the implementation satisfies
+  that stronger form.)
 
 **The idea, in one story.** I want to broadcast a message, and I attach my **history**: my
 vector `V` — how many messages I have delivered from each process — with my own slot set to
@@ -270,7 +279,7 @@ cannot live in this timeout-free module: it is Part II, to be built over
 | M3 | vector clocks + waiting causal delivery (`pending`, `W ≤ V`, drain) | causal order enforced: the *answer* visibly waits for its *question*; concurrent messages remain unordered — correctly |
 
 (M1 and M2 live at commits `863b7da` and `e480823`; HEAD is M3. The `equiv` command exists
-only in M1's revision.)
+in the M1 and M2 revisions and was removed at M3.)
 
 ## 8. Correspondence between theory and code
 
@@ -359,10 +368,12 @@ Wire format: `DATA <origin> <v0,v1,...> <m>` (vector comma-joined; parsed with
   instance of the end-to-end argument from Module 02, and thirty years later both camps can
   claim vindication: causal order thrives *inside* systems (replicated data stores, CRDT
   transports) rather than as a general application API.
-- **Where each clock lives in production.** Lamport-style scalars: timestamps in LWW registers
-  (Cassandra cell timestamps), Raft/Paxos terms and ballots (a term *is* a Lamport clock over
-  leadership events — Module 07). Vector-style: Dynamo/Riak sibling detection, CouchDB
-  revision trees, OT/CRDT collaboration backends, and the causal-consistency metadata of
+- **Where each clock lives in production.** Lamport-style totally ordered scalars: LWW
+  timestamps (often wall-clock in practice, as in Cassandra's cell timestamps — no max+1
+  receive rule, so physical LWW rather than a true Lamport clock), Raft/Paxos terms and
+  ballots (a term *is* a Lamport clock over leadership events — Module 07). Vector-style:
+  Dynamo/Riak sibling detection, OT/CRDT collaboration backends, and the causal-consistency
+  metadata of
   systems like COPS and MongoDB's causal sessions (implemented, notably, with *hybrid logical
   clocks* — Kulkarni et al. 2014 — which bound a Lamport clock to physical time to get both
   monotonicity and meaningful wall-clock readings).
@@ -387,8 +398,9 @@ Wire format: `DATA <origin> <v0,v1,...> <m>` (vector comma-joined; parsed with
   Processing Letters 39(1), 1991.
 - D. S. Parker et al., *Detection of Mutual Inconsistency in Distributed Systems*, IEEE
   Transactions on Software Engineering SE-9(3), 1983. (Version vectors.)
-- S. Kulkarni, M. Demirbas, D. Madappa, B. Avva, M. Leone, *Logical Physical Clocks and
-  Consistent Snapshots in Globally Distributed Databases* (Hybrid Logical Clocks), OPODIS 2014.
+- S. Kulkarni, M. Demirbas, D. Madappa, B. Avva, M. Leone, *Logical Physical Clocks*
+  (Hybrid Logical Clocks), OPODIS 2014. (The longer title *…and Consistent Snapshots in
+  Globally Distributed Databases* is the UB tech-report version, CSE 2014-04.)
 
 **Broadcast and group communication**
 - V. Hadzilacos, S. Toueg, *A Modular Approach to Fault-Tolerant Broadcasts and Related

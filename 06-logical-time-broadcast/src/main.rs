@@ -34,7 +34,7 @@ struct State {
     v: Vec<u64>,                              // v[rank(q)] = # delivered from q
     lsn: u64,                                 // # of my own broadcasts
     pending: Vec<(String, Vec<u64>, String)>, // (origin, W, m) awaiting causal past
-    delivered: HashSet<(String, String)>,     // RB dedup
+    delivered: HashSet<(String, u64)>,        // RB dedup: (origin, per-origin seq)
 }
 
 fn decode(s: &str) -> Option<Message> {
@@ -102,7 +102,7 @@ fn main() {
         delivered: HashSet::new(),
     }));
 
-    // delivered: HashSet<(String, String)>,   // (origin, m) pairs already delivered
+    // delivered: HashSet<(String, u64)>,      // (origin, seq) pairs already delivered
 
     {
         let me = me.clone();
@@ -169,8 +169,21 @@ fn main() {
 
             let mut state = state.lock().unwrap();
 
-            // ── RB layer (unchanged): dedup, relay ──
-            if !state.delivered.insert((from.clone(), m.clone())) {
+            // ── RB layer: dedup, relay ──
+            // Dedup key = (origin, per-origin sequence number). The seq already
+            // rides in the stamp: W[rank(origin)] is the sender's lsn for THIS
+            // message. Keying on (origin, payload) instead would silently drop a
+            // repeated payload while the sender's lsn advanced — permanently
+            // wedging that origin's entire causal stream at every node.
+            let Some(origin_rank) = all.iter().position(|a| a == &from) else {
+                eprintln!("dropping message from unknown origin {from}");
+                return;
+            };
+            if w.len() != all.len() {
+                eprintln!("dropping malformed stamp from {from} (len {})", w.len());
+                return;
+            }
+            if !state.delivered.insert((from.clone(), w[origin_rank])) {
                 return; // seen it: drop
             }
             broadcast(

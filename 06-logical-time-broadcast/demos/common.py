@@ -2,7 +2,7 @@
 
 Launches a 4-node cluster of the compiled binary and drives any node's stdin over
 subprocess pipes (a backgrounded shell pipeline does not reliably deliver stdin)."""
-import os, subprocess, time
+import atexit, os, subprocess, time
 
 HERE = os.path.dirname(__file__)
 CRATE = os.path.abspath(os.path.join(HERE, ".."))
@@ -16,7 +16,10 @@ def peers_of(port):
 
 
 def launch(extra_args=None):
-    """Start all nodes; extra_args maps port -> list of extra CLI args."""
+    """Start all nodes; extra_args maps port -> list of extra CLI args.
+    Registers an atexit kill (a failed demo must not leak a cluster that
+    poisons the next run's ports) and fails loudly if any node died during
+    startup (e.g. its port was still held by a leaked process)."""
     extra_args = extra_args or {}
     procs = {}
     for p in PORTS:
@@ -25,7 +28,11 @@ def launch(extra_args=None):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True,
         )
+    atexit.register(lambda: [pr.kill() for pr in procs.values() if pr.poll() is None])
     time.sleep(1.0)
+    dead = [p for p, pr in procs.items() if pr.poll() is not None]
+    if dead:
+        raise SystemExit(f"nodes failed to start (port in use?): {dead}")
     return procs
 
 
