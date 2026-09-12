@@ -95,14 +95,18 @@ This is **atomic commitment**.
 Following CCGR §6.6, each participant casts a vote in {YES, NO} and processes decide in
 {COMMIT, ABORT}:
 
-- **NBAC1 (Uniform agreement — safety).** No two processes decide differently (whether or not
+- **NBAC1 (Termination — liveness).** Every correct process eventually decides.
+- **NBAC2 (Abort-Validity).** ABORT is decided only if some participant voted NO or crashed.
+- **NBAC3 (Commit-Validity).** COMMIT is decided only if no participant voted NO. (Our
+  implementation enforces the stronger "all participants voted YES" — CCGR's form permits
+  COMMIT when a participant crashed before voting; ours never commits without the full
+  conjunction.)
+- **NBAC4 (Integrity).** No process decides twice.
+- **NBAC5 (Uniform Agreement — safety).** No two processes decide differently (whether or not
   they subsequently crash).
-- **NBAC2 (Integrity).** No process decides twice.
-- **NBAC3 (Commit-validity).** COMMIT is decided only if *all* participants voted YES.
-- **NBAC4 (Abort-validity).** ABORT is decided only if some participant voted NO or crashed.
-- **NBAC5 (Termination — liveness).** Every correct process eventually decides.
 
-2PC satisfies NBAC1–NBAC4. It fails **NBAC5** under coordinator failure — the subject of §4.
+(Numbering follows CCGR Module 6.7 exactly.) 2PC satisfies NBAC2–NBAC5. It fails **NBAC1
+(Termination)** under coordinator failure — the subject of §4.
 
 ## 2. System model
 
@@ -114,7 +118,7 @@ Following CCGR §6.6, each participant casts a vote in {YES, NO} and processes d
   crash and, in the blocking demonstration, never recover.
 - **Links.** Perfect point-to-point links (TCP). An unreachable participant is
   indistinguishable from a crashed one; the coordinator treats a missed reply as a NO
-  (conservative, per NBAC4).
+  (conservative, per NBAC2's abort-validity).
 - **Timing.** Asynchrony suffices for every safety property; the blocking behavior is a
   *liveness* failure and no timing assumption on the participants' side repairs it (§4.3).
 - **Faults are non-malicious.** Processes follow the protocol or crash; Byzantine behavior
@@ -155,6 +159,8 @@ NO forces ABORT regardless of anything else (NBAC3).
 ### 3.2 Phase 2 — decision
 
 The coordinator computes the outcome — the logical conjunction of the votes — and imposes it.
+(In full 2PC the coordinator force-logs the decision *before* Phase 2; that log write is the
+transaction's commit point. We omit the coordinator log — see §8.)
 On `COMMIT txid`, a participant with `prepared = (txid, δ)` applies δ to its balance, clears
 `prepared`, persists, and acknowledges. On `ABORT txid`, it discards the reservation (balance
 untouched), clears `prepared`, persists, and acknowledges. In both cases the *release of the
@@ -162,10 +168,11 @@ in-doubt state* happens only here — the shrinking phase of the lock discipline
 
 ### 3.3 Correctness of the non-liveness properties
 
-*NBAC1:* the only source of decisions is the single coordinator, which computes one outcome per
-txid and sends the same verdict to all. *NBAC3:* COMMIT requires the full conjunction of YES
-votes; a single NO — or an unreachable participant, whose vote cannot be confirmed — yields
-ABORT. *NBAC4:* ABORT arises only from a NO or a missing (crashed/unreachable) participant.
+*NBAC5 (agreement):* the only source of decisions is the single coordinator, which computes
+one outcome per txid and sends the same verdict to all. *NBAC3 (commit-validity):* COMMIT
+requires the full conjunction of YES votes; a single NO — or an unreachable participant, whose
+vote cannot be confirmed — yields ABORT. *NBAC2 (abort-validity):* ABORT arises only from a NO
+or a missing (crashed/unreachable) participant.
 *Durability of the outcome at a participant:* a participant that voted YES has its vote on
 stable storage; if it crashes and recovers, it is *still in doubt* — it comes back holding
 `(txid, δ)` and awaiting the verdict, so a crash cannot cause it to forget a promise the
@@ -180,7 +187,8 @@ Let the coordinator crash *after* collecting a full set of YES votes and *before
 any verdict. Every participant is in doubt, and:
 
 - **it cannot decide unilaterally.** Deciding ABORT may contradict a COMMIT the coordinator
-  already sent to some other participant before crashing (violating NBAC1); deciding COMMIT may
+  already sent to some other participant before crashing (violating NBAC5, agreement);
+  deciding COMMIT may
   likewise contradict an ABORT. Both outcomes are consistent with the participant's local
   state — this is precisely what "in doubt" means;
 - **it cannot consult its peers** — the star topology provides no participant↔participant
@@ -190,7 +198,7 @@ any verdict. Every participant is in doubt, and:
   a recovered participant that forgot its YES could vote for a conflicting transaction.)
 
 The participant therefore waits indefinitely, holding its reservation; every future transaction
-that touches the reserved resources is refused. NBAC5 fails. The demonstration
+that touches the reserved resources is refused. NBAC1 (Termination) fails. The demonstration
 `demos/blocking.py` stages exactly this execution (a coordinator that stops after Phase 1) and
 then shows a subsequent, well-formed transaction being refused by every participant.
 
@@ -205,11 +213,14 @@ supplying the missing event from elsewhere, which is exactly what the repairs of
 
 The blocking of 2PC is not an implementation defect but the shadow of a genuine impossibility
 gap. In the failure-detector hierarchy, NBAC is *harder* than consensus: consensus is solvable
-with the eventual leader detector Ω and a correct majority (Module 07), whereas NBAC in general
-requires the **perfect** failure detector *P* — deciding COMMIT requires certainty that no
-participant has crashed (NBAC4 ties the outcome to crashes), and certainty about crashes is
-exactly what no eventually-accurate detector provides (CCGR Ch. 6 develops NBAC from consensus
-plus a perfect failure detector). Two consequences follow: under partial synchrony one should
+with the eventual leader detector Ω and a correct majority (Module 07), whereas NBAC needs
+*accurate* crash detection: with a vote missing, termination forces a decision, the only valid
+one is ABORT — and abort-validity (NBAC2) permits it only if some participant voted NO or
+*actually crashed*. A false suspicion would produce an invalid ABORT, and accuracy is exactly
+what no eventually-accurate detector provides. CCGR solves NBAC from consensus plus the
+**perfect** detector *P* (Algorithm 6.6); *P* is sufficient but not necessary — the weakest
+detector for NBAC is strictly weaker (anonymous crash detection: it must certify that *some*
+crash occurred, without naming it; Guerraoui 2002, Delporte-Gallet et al. 2004). Two consequences follow: under partial synchrony one should
 *expect* atomic commitment to inherit consensus's machinery rather than avoid it; and the
 "unanimity vs. majority" contrast with Module 07 is a difference in *validity properties*, not
 merely in engineering.
@@ -218,7 +229,7 @@ merely in engineering.
 |---|---|---|
 | decision function | any proposed value | conjunction of votes (COMMIT iff all YES) |
 | decision quorum | majority | all participants, via one coordinator |
-| detector needed | ◇P / Ω (with majority) | P (in general) |
+| detector needed | ◇P / Ω (with majority) | accurate crash detection (P suffices) |
 | coordinator/leader crash | new leader elected; progress resumes | participants block in doubt |
 
 ## 5. The in-doubt state is a lock: strict two-phase locking
@@ -247,10 +258,13 @@ distinction is in [CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENC
 
 ## 6. Repairs: toward non-blocking atomic commitment
 
-- **Cooperative termination / three-phase commit** (Skeen 1981). Adding a *pre-commit* round
-  and letting in-doubt participants poll one another allows termination when failures are
-  crash-stop and the network is synchronous; under partitions 3PC can violate safety, and it is
-  rarely deployed.
+- **Cooperative termination** (Bernstein–Hadzilacos–Goodman 1987). In-doubt participants poll
+  one another: if any reachable peer already knows the verdict — or never voted YES — the
+  execution unblocks. Rescues many executions, but not the all-in-doubt one. *(Exercise 4
+  implements it.)*
+- **Three-phase commit** (Skeen 1981). Adds a *pre-commit* round so that even the all-in-doubt
+  case is decidable — under crash-stop failures and a synchronous network; under partitions
+  3PC can violate safety, and it is rarely deployed.
 - **Paxos Commit** (Gray & Lamport 2006). The principled repair, given §4.3: make the *decision
   itself* fault-tolerant by running it through consensus. Each participant's vote is registered
   in a consensus instance (or the coordinator is a replicated state machine); no single crash
@@ -268,7 +282,7 @@ distinction is in [CONSISTENCY_AND_CONCURRENCY.md](../CONSISTENCY_AND_CONCURRENC
 |---|---|
 | transaction over partitions | per-participant deltas: `transfer δ₁ δ₂ …`, `δᵢ → participantᵢ` |
 | NBAC3 (commit-validity) | `all_yes`: COMMIT iff every reply equals `VOTE txid YES` |
-| NBAC4 (abort-validity) | a NO vote *or* an unreachable participant (`send → None`) forces ABORT |
+| NBAC2 (abort-validity) | a NO vote *or* an unreachable participant (`send → None`) forces ABORT |
 | in-doubt state / strict-2PL lock | `prepared: Option<(u64, i64)>`; set on YES, refused-while-held, cleared on verdict |
 | durable vote (persist-before-externalize) | `persist()` fsyncs balance + `prepared` before replying; `load()` restores on restart |
 | the blocking execution | the `transfer-crash` command: run Phase 1, then stop — no verdict is ever sent |
@@ -288,6 +302,15 @@ realizes the §4.1 crash point deterministically, in the tradition of fault inje
   volatile; a restarted coordinator reuses identifiers, and a new transaction's ABORT could
   then wrongly release an unrelated in-doubt lock — a genuine safety defect, found during
   development. Persistent or consensus-allocated txids repair it. *(→ Exercise 3.)*
+- **Verdict delivery is fire-and-forget.** The coordinator sends each COMMIT/ABORT once and
+  never retries; a participant that crashes between its YES and the verdict recovers in doubt
+  and *stays* in doubt forever, even though the coordinator is alive and decided — a
+  permanently half-applied transaction in an execution classical 2PC terminates routinely
+  (the coordinator retries until acknowledged; recovering participants inquire). *(Exercise 4's
+  cooperative termination is one repair; retry-until-ACK is the classical one.)*
+- **No coordinator decision log.** Full 2PC force-logs the decision before Phase 2 (the commit
+  point); our coordinator holds it only in memory, so its crash between sends can leave
+  participants with contradictory-looking histories that only its memory could reconcile.
 - **Whole-node locking.** One in-doubt transaction at a time per participant; real systems lock
   at item granularity, admitting concurrent disjoint transactions.
 - **Sequential Phase 1** (an optimization, not a correctness issue); no presumed-abort /
@@ -298,11 +321,12 @@ realizes the §4.1 crash point deterministically, in the tradition of fault inje
 
 1. **(In-doubt reasoning.)** In the execution of §4.1, suppose an in-doubt participant
    unilaterally aborts after a timeout. Construct the completion of the execution that violates
-   NBAC1. Then explain why a timeout on the *coordinator's* side (aborting when a vote is slow)
+   NBAC5 (agreement). Then explain why a timeout on the *coordinator's* side (aborting when a
+   vote is slow)
    is, by contrast, always safe.
 2. **(Presumed abort.)** In industrial 2PC, a coordinator that finds no record of a txid answers
    ABORT ("presumed abort"), letting it forget aborted transactions. Specify precisely which log
-   writes this removes, and re-verify NBAC1/NBAC4 under coordinator crash-recovery.
+   writes this removes, and re-verify NBAC5/NBAC2 under coordinator crash-recovery.
 3. **(Identifier discipline.)** Demonstrate the txid-collision defect against the current code
    (two coordinator sessions), then repair it (persist the counter, or derive txids from a
    durable epoch) and re-run the demonstration.

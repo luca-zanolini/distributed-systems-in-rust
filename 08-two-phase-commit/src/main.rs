@@ -19,19 +19,29 @@ fn persist(balance: i64, prepared: &Option<(u64, i64)>, path: &str) {
         None => "-".to_string(),
     };
     let data = format!("balance {balance}\nprepared {p}\n");
-    if let Ok(mut f) = std::fs::File::create(path) {
-        let _ = f.write_all(data.as_bytes());
-        let _ = f.sync_all(); // fsync: force to the platter before we return
-    }
+    // Write-then-rename: creating the file in place would truncate the previous
+    // state first, so a crash mid-persist could erase a committed balance or a
+    // persisted YES. And a FAILED persist must not be survivable — replying after
+    // one would violate persist-before-externalize — so we crash instead.
+    let tmp = format!("{path}.tmp");
+    let mut f = std::fs::File::create(&tmp).expect("create state file");
+    f.write_all(data.as_bytes()).expect("write state");
+    f.sync_all().expect("fsync state"); // force to the platter before we return
+    std::fs::rename(&tmp, path).expect("rename state file");
 }
 
 // Reload durable state on startup. None => no file yet (fresh node).
 fn load(path: &str) -> Option<(i64, Option<(u64, i64)>)> {
     let data = std::fs::read_to_string(path).ok()?;
     let (mut balance, mut prepared) = (100i64, None);
+    let mut saw_balance = false;
     for line in data.lines() {
         if let Some(v) = line.strip_prefix("balance ") {
-            balance = v.parse().unwrap_or(100);
+            // A torn or malformed state file must HALT the node, not silently
+            // reset money to the default — that would be a durability violation
+            // wearing a recovery costume.
+            balance = v.parse().expect("state file corrupt: run recovery by hand");
+            saw_balance = true;
         } else if let Some(v) = line.strip_prefix("prepared ") {
             if v != "-" {
                 let mut it = v.split_whitespace();
@@ -43,6 +53,7 @@ fn load(path: &str) -> Option<(i64, Option<(u64, i64)>)> {
             }
         }
     }
+    assert!(saw_balance, "state file corrupt (no balance line): run recovery by hand");
     Some((balance, prepared))
 }
 
@@ -88,7 +99,7 @@ fn run_participant(port: String) {
                     if ptxid == txid {
                         balance += delta;
                         prepared = None;
-                        persist(balance, &prepared, &state_path); // ← add this
+                        persist(balance, &prepared, &state_path); // the verdict's effect is durable BEFORE we acknowledge
                     }
                 }
                 format!("ACK {txid}")
@@ -98,7 +109,7 @@ fn run_participant(port: String) {
                 if let Some((ptxid, _)) = prepared {
                     if ptxid == txid {
                         prepared = None;
-                        persist(balance, &prepared, &state_path); // ← add this
+                        persist(balance, &prepared, &state_path); // the verdict's effect is durable BEFORE we acknowledge
                     }
                 }
                 format!("ACK {txid}")

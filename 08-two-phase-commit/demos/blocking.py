@@ -6,7 +6,7 @@ verdict. Both participants are now in-doubt, locked. tx2 = a normal `transfer`: 
 REFUSED (both vote NO — they're locked by tx1), so tx2 aborts, but tx2's abort does NOT
 free tx1's lock. The accounts are wedged forever.
 
-Contrast with Raft (05): a majority-based protocol survives losing a node. 2PC, needing
+Contrast with Raft (07): a majority-based protocol survives losing a node. 2PC, needing
 unanimity through a single coordinator, does not. This is why *consensus ≠ atomic commit*."""
 import common as c
 import time
@@ -30,7 +30,7 @@ print("\n   Both accounts remain LOCKED on tx1. tx1's verdict will NEVER arrive"
 print("   (its coordinator is gone), so the lock is held forever — across any restart.")
 print("   Every future transaction on these accounts will be refused. The cluster is wedged.")
 print("\n   Fix (out of scope here): make the coordinator itself fault-tolerant via consensus")
-print("   → that is Paxos Commit = 2PC's decision run through Raft/Paxos (05).")
+print("   → that is Paxos Commit = 2PC's decision run through Raft/Paxos (07).")
 
 c.stop_all(hard=True)
 c.clean_state()
