@@ -43,6 +43,7 @@ fn apply(s: &mut State) {
     }
 }
 
+#[allow(dead_code)] // retained for the unit tests
 fn port_of(addr: &str) -> u16 {
     addr.rsplit(':')
         .next()
@@ -57,7 +58,9 @@ fn request_vote(
     last_index: usize,
     last_term: u64,
 ) -> Option<(u64, bool)> {
-    let mut conn = TcpStream::connect(peer).ok()?;
+    let sa: std::net::SocketAddr = peer.parse().ok()?;
+    let mut conn = TcpStream::connect_timeout(&sa, Duration::from_millis(500)).ok()?;
+    conn.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
     conn.write_all(format!("requestvote {term} {me} {last_index} {last_term}\n").as_bytes())
         .ok()?;
     let mut reply = String::new();
@@ -101,7 +104,9 @@ fn append_entries(
     commit: usize,
     entries: &str,
 ) -> Option<(u64, usize)> {
-    let mut conn = TcpStream::connect(peer).ok()?;
+    let sa: std::net::SocketAddr = peer.parse().ok()?;
+    let mut conn = TcpStream::connect_timeout(&sa, Duration::from_millis(500)).ok()?;
+    conn.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
     conn.write_all(format!("append {term} {leader} {commit} {entries}\n").as_bytes())
         .ok()?;
     let mut reply = String::new();
@@ -110,6 +115,16 @@ fn append_entries(
         ["appendack", t, len] => Some((t.parse().ok()?, len.parse().ok()?)),
         _ => None,
     }
+}
+
+/// Randomized election timeout, RE-DRAWN at every expiry (the paper's scheme):
+/// repeated split votes only resolve if colliding candidates draw apart next round.
+fn rand_timeout() -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    Duration::from_millis(1500 + nanos % 1500)
 }
 
 fn persist(s: &State, path: &str) {
@@ -121,10 +136,16 @@ fn persist(s: &State, path: &str) {
         s.commit_index,
         serialize_log(&s.log)
     );
-    if let Ok(mut f) = std::fs::File::create(path) {
-        let _ = f.write_all(data.as_bytes());
-        let _ = f.sync_all(); // fsync — durable to disk BEFORE we return (a crash can't lose it)
-    }
+    // Write-then-rename: File::create would truncate the previous state in place,
+    // so a crash mid-persist could erase term/vote/log entirely — re-enabling the
+    // double-vote and lost-commit failures this function exists to prevent. And a
+    // FAILED persist must not be survivable: replying after a failed persist would
+    // violate persist-before-externalize, so we crash instead.
+    let tmp = format!("{path}.tmp");
+    let mut f = std::fs::File::create(&tmp).expect("create state file");
+    f.write_all(data.as_bytes()).expect("write state");
+    f.sync_all().expect("fsync state"); // durable BEFORE we return (a crash can't lose it)
+    std::fs::rename(&tmp, path).expect("rename state file");
 }
 
 fn load(path: &str) -> Option<(u64, Option<String>, usize, Vec<Entry>)> {
@@ -151,8 +172,7 @@ fn main() {
     let me = format!("127.0.0.1:{port}");
     let total = peers.len() + 1;
     let majority = total / 2 + 1;
-    let election_timeout = Duration::from_millis(1500 + (port_of(&me) as u64 % 7) * 300);
-    println!("node {me} — peers {peers:?} — timeout {election_timeout:?}, majority {majority}");
+    println!("node {me} — peers {peers:?} — timeout randomized 1500–3000 ms, majority {majority}");
 
     let state_path = format!("raft-{port}.state");
     let (t0, v0, c0, log0) = load(&state_path).unwrap_or((0, None, 0, Vec::new()));
@@ -182,6 +202,7 @@ fn main() {
         let state = Arc::clone(&state);
         let state_path = state_path.clone(); // the thread gets its own copy of the path
         thread::spawn(move || {
+            let mut election_timeout = rand_timeout();
             loop {
                 thread::sleep(Duration::from_millis(200));
 
@@ -196,18 +217,50 @@ fn main() {
                         let s = state.lock().unwrap();
                         (s.log.len(), serialize_log(&s.log), s.commit_index)
                     };
-                    // AppendEntries to every peer; collect each one's log length (0 if unreachable)
+                    // AppendEntries to every peer. Two rules the paper's Figure 2
+                    // demands and a stale leader dies without: (a) a response
+                    // carrying a HIGHER term deposes us; (b) only SAME-term acks
+                    // count toward commitment — a rejecting follower's log length
+                    // is not agreement.
                     let mut lengths = vec![self_len]; // self counts
+                    let mut max_seen_term = term;
                     for peer in &peers {
-                        let len = append_entries(peer, term, &me, commit, &blob)
-                            .map(|(_, l)| l)
-                            .unwrap_or(0);
-                        lengths.push(len);
+                        if let Some((t, len)) = append_entries(peer, term, &me, commit, &blob) {
+                            if t > max_seen_term {
+                                max_seen_term = t;
+                            }
+                            if t == term {
+                                lengths.push(len);
+                            }
+                        }
+                    }
+                    let mut s = state.lock().unwrap();
+                    if max_seen_term > s.term {
+                        s.term = max_seen_term;
+                        s.role = Role::Follower;
+                        s.voted_for = None;
+                        persist(&s, &state_path);
+                        println!("term {}: {me} → FOLLOWER (higher term in ack)", s.term);
+                        continue;
+                    }
+                    // Re-check we are STILL the leader of the term we snapshotted:
+                    // the round took wall-clock time, and a RequestVote handler may
+                    // have deposed us mid-round. Committing on a stale snapshot is
+                    // exactly the Figure 8 violation.
+                    if s.role != Role::Leader || s.term != term {
+                        continue;
                     }
                     lengths.sort_unstable_by(|a, b| b.cmp(a));
-                    let agreed = lengths[majority - 1];
-                    let mut s = state.lock().unwrap();
-                    if agreed > s.commit_index && agreed > 0 && s.log[agreed - 1].term == term {
+                    let agreed = if lengths.len() >= majority {
+                        lengths[majority - 1]
+                    } else {
+                        0
+                    };
+                    if agreed > s.commit_index
+                        && agreed > 0
+                        && agreed <= s.log.len()
+                        && s.log[agreed - 1].term == term
+                    {
                         s.commit_index = agreed;
                     }
                     persist(&s, &state_path);
@@ -220,6 +273,10 @@ fn main() {
                 if !timed_out {
                     continue;
                 }
+
+                // Re-draw the timeout for the NEXT round — colliding candidates
+                // must be able to draw apart, or split votes can repeat forever.
+                election_timeout = rand_timeout();
 
                 // Become a candidate for a NEW term (short lock), snapshot the term.
                 let (term, last_index, last_term) = {
@@ -238,13 +295,17 @@ fn main() {
                 };
 
                 let total = peers.len() + 1; // including self
+                let mut max_seen_term = term;
                 let votes: usize = {
                     let mut count = 1; // self-vote
                     for peer in &peers {
-                        if let Some((_, granted)) =
+                        if let Some((t, granted)) =
                             request_vote(peer, term, &me, last_index, last_term)
                         {
-                            if granted {
+                            if t > max_seen_term {
+                                max_seen_term = t;
+                            }
+                            if granted && t == term {
                                 count += 1;
                             }
                         }
@@ -254,6 +315,14 @@ fn main() {
 
                 // Won? Re-lock and confirm we're STILL a candidate in the SAME term.
                 let mut s = state.lock().unwrap();
+                if max_seen_term > s.term {
+                    s.term = max_seen_term;
+                    s.role = Role::Follower;
+                    s.voted_for = None;
+                    persist(&s, &state_path);
+                    println!("term {}: {me} → FOLLOWER (higher term in vote reply)", s.term);
+                    continue;
+                }
                 if s.role == Role::Candidate && s.term == term && votes >= majority {
                     s.role = Role::Leader;
                     println!("term {term}: {me} → LEADER ({votes}/{total} votes)");
@@ -269,6 +338,7 @@ fn main() {
             Ok(w) => w,
             Err(_) => continue,
         };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         if reader.read_line(&mut line).is_err() {
@@ -324,7 +394,8 @@ fn main() {
                         s.role = Role::Follower;
                         s.last_heard = Instant::now();
                         s.log = parse_entries(entries); // adopt the leader's log (Step 2 simplification)
-                        s.commit_index = leader_commit.min(s.log.len());
+                        // Monotone: commitIndex never decreases (Figure 2).
+                        s.commit_index = s.commit_index.max(leader_commit.min(s.log.len()));
                         apply(&mut s);
                         persist(&s, &state_path);
                     }
@@ -333,6 +404,13 @@ fn main() {
                 let _ = writeln!(writer, "appendack {my_term} {my_len}");
             }
             ["set", ..] | ["remove", ..] => {
+                // The log wire format uses '|' and '~' as delimiters and \u{1F} as
+                // the space stand-in; a command containing them would be resplit
+                // into DIFFERENT entries at each replica — divergent state machines.
+                if line.contains('|') || line.contains('~') || line.contains('\u{1f}') {
+                    let _ = writeln!(writer, "ERR command may not contain '|', '~', or U+001F");
+                    continue;
+                }
                 let mut s = state.lock().unwrap();
                 if s.role == Role::Leader {
                     let term = s.term; // read first (ends the borrow) — the guard Derefs the WHOLE State

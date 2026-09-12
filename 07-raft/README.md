@@ -234,6 +234,17 @@ across a blocking round-trip is the canonical route to distributed deadlock). Wi
   followers behind the truncation point.
 - **Static membership.** Cluster reconfiguration requires joint consensus (or single-server
   changes) — a protocol of its own.
+- **Writes are acknowledged before commitment.** The leader replies `OK (log index N)` once
+  the entry is appended and persisted *locally* — before replication. An acked-but-uncommitted
+  entry can be legitimately superseded after a leader change, so the OK means "accepted into
+  the leader's log", not "committed". Real Raft replies only after the entry is applied to the
+  state machine. (The demos wait between write and kill precisely so commitment completes.)
+- **The listener is sequential.** Inbound connections are served one at a time with a bounded
+  (1 s) read; a hostile or broken peer can still slow the node by a second per connection.
+  Production nodes read concurrently.
+- **The log wire format reserves `|`, `~`, and U+001F**; client commands containing them are
+  rejected at the interface — otherwise a command would be re-split into different entries at
+  different replicas, diverging the state machines.
 - **No client sessions.** A retried command may apply twice; exactly-once *effect* requires
   client identifiers and deduplication. Reads are served by the leader without a ReadIndex or
   lease, so a deposed leader could briefly serve stale reads.

@@ -43,14 +43,24 @@ def statefiles():
 for f in glob.glob(os.path.join(STATE_DIR, "raft-*.state")):  # fresh start
     os.remove(f)
 
+def find_leader():
+    # randomized election timeouts: ANY node may lead — probe for it.
+    for _ in range(20):
+        for p in PEERS:
+            if cmd(p, "get __probe") != "NOT LEADER":
+                return p
+        time.sleep(0.5)
+    return "6000"
+
 try:
     start_all()
     time.sleep(2.5)
-    print("1) write to the cluster:")
-    print("   set x 1        ->", cmd("6000", "set x 1"))
-    print("   set name luca  ->", cmd("6000", "set name luca"))
+    leader = find_leader()
+    print(f"1) write to the cluster (leader: {leader}):")
+    print(f"   set x 1        ->", cmd(leader, "set x 1"))
+    print(f"   set name luca  ->", cmd(leader, "set name luca"))
     time.sleep(0.6)
-    print("   get x @6000    ->", cmd("6000", "get x"))
+    print(f"   get x @{leader}    ->", cmd(leader, "get x"))
 
     print("2) KILL THE WHOLE CLUSTER (all 3 nodes crash):")
     stop_all()
@@ -60,6 +70,7 @@ try:
     print("3) restart all 3 (each reloads from disk), wait for re-election:")
     start_all()
     time.sleep(3.5)
+    find_leader()  # wait until SOME node leads again
     print("   did the data survive a FULL-cluster crash?")
     for p in ("6000", "6001", "6002"):
         print(f"   get x    @{p} -> {cmd(p, 'get x')}")

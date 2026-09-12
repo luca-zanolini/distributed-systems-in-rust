@@ -24,21 +24,35 @@ def cmd(port, line):
     except Exception as e:
         return f"(err {e})"
 
-try:
-    time.sleep(2.5)  # 6000 becomes leader
-    print("1) write to leader 6000:")
-    print("   set x 1        ->", cmd("6000", "set x 1"))
-    print("   set name luca  ->", cmd("6000", "set name luca"))
-    time.sleep(0.6)  # replicate + commit on a majority
-    print("   get x @6000    ->", cmd("6000", "get x"))
+procs = {"6000": A, "6001": B, "6002": C}
 
-    print("2) KILL leader 6000, wait for failover:")
-    A.terminate(); A.wait()
+def find_leader(ports):
+    # randomized election timeouts: ANY node may lead — probe for it.
+    for _ in range(20):
+        for p in ports:
+            if cmd(p, "get __probe") != "NOT LEADER":
+                return p
+        time.sleep(0.5)
+    return ports[0]
+
+try:
+    time.sleep(2.5)
+    leader = find_leader(list(procs))
+    print(f"1) write to leader {leader}:")
+    print(f"   set x 1        ->", cmd(leader, "set x 1"))
+    print(f"   set name luca  ->", cmd(leader, "set name luca"))
+    time.sleep(0.6)  # replicate + commit on a majority
+    print(f"   get x @{leader}    ->", cmd(leader, "get x"))
+
+    print(f"2) KILL leader {leader}, wait for failover:")
+    procs[leader].terminate(); procs[leader].wait()
+    survivors = [p for p in procs if p != leader]
     time.sleep(4.0)
-    print("   does the data survive on the new leader?")
-    for p in ("6001", "6002"):
+    new_leader = find_leader(survivors)
+    print(f"   does the data survive on the new leader ({new_leader})?")
+    for p in survivors:
         print(f"   get x @{p}     ->", cmd(p, "get x"))
-    for p in ("6001", "6002"):
+    for p in survivors:
         print(f"   get name @{p}  ->", cmd(p, "get name"))
 finally:
     for x in (A, B, C):

@@ -10,10 +10,25 @@ A = launch("6000", ["127.0.0.1:6001", "127.0.0.1:6002"])
 B = launch("6001", ["127.0.0.1:6000", "127.0.0.1:6002"])
 C = launch("6002", ["127.0.0.1:6000", "127.0.0.1:6001"])  # survives the whole run
 
-time.sleep(2.5)
-print(">> killing leader 6000")
-A.terminate(); A.wait()
-time.sleep(4.0)  # a survivor times out → new election in a higher term
+procs = {"6000": A, "6001": B, "6002": C}
+
+def current_leader():
+    # timeouts are randomized (as in the paper), so ANY node may lead —
+    # discover the leader from the logs instead of assuming one.
+    for p in procs:
+        try:
+            for l in open(f"/tmp/raft_{p}.log").read().splitlines():
+                if "LEADER" in l:
+                    return p
+        except Exception:
+            pass
+    return None
+
+time.sleep(3.5)
+leader = current_leader() or "6000"
+print(f">> killing leader {leader}")
+procs[leader].terminate(); procs[leader].wait()
+time.sleep(5.0)  # a survivor times out → new election in a higher term
 for x in (A, B, C):
     x.terminate()
 time.sleep(0.3)
