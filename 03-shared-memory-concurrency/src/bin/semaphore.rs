@@ -1,34 +1,8 @@
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-struct Semaphore {
-    permits: Mutex<usize>,
-    available: Condvar,
-}
-
-impl Semaphore {
-    fn new(permits: usize) -> Self {
-        Semaphore {
-            permits: Mutex::new(permits),
-            available: Condvar::new(),
-        }
-    }
-
-    fn acquire(&self) {
-        let mut count = self.permits.lock().unwrap();
-        while *count == 0 {
-            count = self.available.wait(count).unwrap();
-        }
-        *count -= 1;
-    }
-
-    fn release(&self) {
-        let mut count = self.permits.lock().unwrap();
-        *count += 1;
-        self.available.notify_one();
-    }
-}
+use shared_memory_concurrency::Semaphore;
 
 fn main() {
     let sem = Arc::new(Semaphore::new(3));
