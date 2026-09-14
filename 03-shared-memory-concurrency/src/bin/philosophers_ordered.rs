@@ -1,4 +1,3 @@
-use std::cmp::{max, min};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
