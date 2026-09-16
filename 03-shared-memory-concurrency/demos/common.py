@@ -23,11 +23,11 @@ def build():
         sys.exit("BUILD FAILED")
 
 
-def run(name, timeout=None):
+def run(name, timeout=None, args=()):
     """Run a binary; returns (completed, output, seconds). completed=False on timeout."""
     t0 = time.monotonic()
     try:
-        r = subprocess.run([str(BIN / name)], capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run([str(BIN / name), *args], capture_output=True, text=True, timeout=timeout)
         return True, r.stdout, time.monotonic() - t0
     except subprocess.TimeoutExpired as e:
         out = e.stdout.decode() if e.stdout else ""

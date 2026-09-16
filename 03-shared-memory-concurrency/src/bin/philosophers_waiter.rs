@@ -11,7 +11,13 @@ fn main() {
     }
 
     let mut handles = Vec::new();
-    let table = Arc::new(Semaphore::new(4));
+    // Seat count from argv (default 4). 4 = the cure; 5 = the control experiment
+    // (bouncer admits everyone -> the deadlock returns).
+    let seats: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let table = Arc::new(Semaphore::new(seats));
     for i in 0..5 {
         let left = Arc::clone(&forks[i]);
         let right = Arc::clone(&forks[(i + 1) % 5]);

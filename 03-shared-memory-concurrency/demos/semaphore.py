@@ -27,4 +27,4 @@ for line in out.splitlines():
 assert enters == 8, f"{enters} workers entered, expected 8"
 assert inside == 0, "ENTER/EXIT imbalance — someone never left"
 print(f"8 workers, peak concurrency {peak}, total {secs*1000:.0f}ms")
-verdict(peak <= 3, f"peak concurrency {peak} <= 3 permits; all 8 workers served")
+verdict(peak == 3, f"peak concurrency exactly {peak} of 3 permits; all 8 workers served")

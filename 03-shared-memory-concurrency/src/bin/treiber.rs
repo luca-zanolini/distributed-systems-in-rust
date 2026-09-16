@@ -27,6 +27,8 @@ impl TreiberStack {
 
         loop {
             let seen = self.top.load(Ordering::Acquire);
+            // SAFETY: `node` came from Box::into_raw above — valid, aligned, and
+            // exclusively ours until the CAS below publishes it.
             unsafe {
                 (*node).next = seen;
             }
@@ -47,6 +49,9 @@ impl TreiberStack {
                 return None; 
             }
 
+            // SAFETY: `seen` was a non-null top, and nodes are never freed in this
+            // design — the pointee is still alive even if a rival popped it after
+            // our load (the load-bearing leak is what makes this dereference sound).
             let next = unsafe { (*seen).next };
 
             match self
@@ -54,7 +59,8 @@ impl TreiberStack {
                 .compare_exchange(seen, next, Ordering::Release, Ordering::Acquire)
             {
                 Ok(_) => {
-
+                    // SAFETY: the won CAS unlinked `seen`, so no new thread can reach
+                    // it; the never-freed guarantee keeps the allocation alive for us.
                     let value = unsafe { (*seen).value };
 
                     return Some(value);

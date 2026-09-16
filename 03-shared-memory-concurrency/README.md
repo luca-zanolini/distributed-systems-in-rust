@@ -78,7 +78,8 @@ twice. Measured (warm, best-of-3, 50 items through a 10-slot buffer with 10 ms n
 every blocked side commits to a full blind nap even if the world changes a microsecond
 later. Shrink the nap and the sleep converts to CPU burn; there is *no good value for the
 dial*. Worse, polling performance depends on the accidental phase relationship of the two
-sides' clocks (our 100 ms-nap variant was only 1.75× slower than the 10 ms one — batching
+sides' clocks (a 100 ms-nap variant, measured during development and not kept in the
+tree, was only 1.75× slower than the 10 ms one — batching
 dynamics, not linearity): polling is not just slow, it is *hard to reason about*.
 
 **The condition variable deletes the dial.** `Condvar::wait(guard)` atomically releases
@@ -97,7 +98,10 @@ any timer. Three laws, each load-bearing:
   provably hold it again before touching the data). Three classical condvar bugs —
   wait-without-lock, sleep-with-lock, touch-after-wake-without-lock — are unrepresentable,
   by move semantics alone. A `(Mutex<State>, Condvar)` pair with its methods *is* a
-  monitor (Hoare 1974), assembled by hand.
+  monitor (Hoare 1974), assembled by hand — with **Mesa semantics** (Lampson–Redell
+  1980): a notify is a hint, not a hand-off of the lock, which is exactly why the law
+  above puts every wait in a `while`. (In Hoare's original signal-and-wait monitors the
+  recheck would be unnecessary; no mainstream implementation kept that discipline.)
 
 ## 3. The semaphore: a sticky counter
 
@@ -159,7 +163,9 @@ tiebreak.)
 our own `Semaphore::new(4)` at the door. With at most 4 armed philosophers sharing 5
 forks, someone's second fork is provably free; every waiter chain terminates at an eater.
 Note what survives: hold-and-wait is intact — the cure removes the *ring*, not the
-waiting. **Control experiment:** set the bouncer to 5 and the deadlock returns —
+waiting. **Control experiment:** set the bouncer to 5 and the deadlock returns
+(reproducible: `cargo run --bin philosophers_waiter 5`; the demo script runs this
+control case) —
 
 | seats | meals | outcome |
 |---|---|---|
@@ -230,8 +236,8 @@ out of scope by design; this module uses exactly the three named here.
 
 ## 7. Lock-free: the Treiber stack
 
-**Program:** `treiber.rs` (step A, single-threaded raw-pointer chain, is in git history;
-the file is step B, lock-free).
+**Program:** `treiber.rs` — step B, the lock-free stack. (Step A — the single-threaded
+raw-pointer chain it grew from, described below — is yours to write: exercise 6.)
 
 **Why lock-free at all — not speed: *progress*.** A lock makes the structure's liveness
 hostage to the current holder: preempt or kill the holder and everyone parks behind a door
@@ -334,8 +340,9 @@ nothing until you check *what* it is a number of.
 5. **Starvation probe.** Under a continuous 4-reader storm, measure a writer's
    `write()`-acquisition latency distribution on your platform. Compare with a fair lock
    (e.g., `parking_lot` with fairness enabled).
-6. **Single-threaded reclamation.** In step A of the stack (git history), free popped
-   nodes with `Box::from_raw` and argue why the same line in step B would be
+6. **Step A, and single-threaded reclamation.** Write step A of the stack: the same
+   `Node` chain driven by one thread — raw pointers, no atomics, no `Arc`. There, free
+   popped nodes with `Box::from_raw`, and argue why the same line in step B would be a
    use-after-free. State the exact claim reclamation must prove.
 7. **ABA on paper.** With recycled addresses, construct the classic pop interleaving
    where CAS succeeds wrongly. Then show why our never-free policy makes the
@@ -366,11 +373,15 @@ or let the demo script kill it on schedule.
 
 ## References
 
-- E. W. Dijkstra, *Cooperating Sequential Processes* (EWD 123), 1965 — semaphores, the
-  producer–consumer and dining-philosophers problems; this module's founding document.
+- E. W. Dijkstra, *Cooperating Sequential Processes* (EWD 123), 1965 — semaphores and
+  the producer–consumer problem; this module's founding document. The dining
+  philosophers first appear in his *Hierarchical Ordering of Sequential Processes*
+  (EWD 310), Acta Informatica 1(2), 1971 (the table setting is Hoare's).
 - C. A. R. Hoare, *Monitors: An Operating System Structuring Concept*, CACM 17(10), 1974 —
   the mutex+condvar discipline of §2. (P. Brinch Hansen's *Operating System Principles*,
   1973, develops the same idea.)
+- B. W. Lampson, D. D. Redell, *Experience with Processes and Monitors in Mesa*, CACM
+  23(2), 1980 — signal-and-continue semantics; why §2's waits recheck in a loop.
 - E. G. Coffman, M. J. Elphick, A. Shoshani, *System Deadlocks*, ACM Computing Surveys
   3(2), 1971 — the four conditions of §4.
 - P. J. Courtois, F. Heymans, D. L. Parnas, *Concurrent Control with "Readers" and
@@ -379,8 +390,9 @@ or let the demo script kill it on schedule.
   1974 — the bakery algorithm: mutual exclusion from reads and writes alone.
 - R. K. Treiber, *Systems Programming: Coping with Parallelism*, IBM Research Report
   RJ 5118, 1986 — the lock-free stack of §7.
-- M. Herlihy, *Wait-Free Synchronization*, ACM TOPLAS 13(1), 1991 — lock-/wait-freedom
-  and the consensus hierarchy (registers 1, fetch-and-add 2, CAS ∞) behind §6–7.
+- M. Herlihy, *Wait-Free Synchronization*, ACM TOPLAS 13(1), 1991 — wait-freedom and
+  the consensus hierarchy (registers 1, fetch-and-add 2, CAS ∞) behind §6–7; the
+  modern lock-free/wait-free taxonomy is standardized in Herlihy–Shavit (below).
 - M. M. Michael, *Hazard Pointers: Safe Memory Reclamation for Lock-Free Objects*, IEEE
   TPDS 15(6), 2004 — the reclamation problem of §7, solved.
 - M. Herlihy, N. Shavit, V. Luchangco, M. Spear, *The Art of Multiprocessor Programming*,
