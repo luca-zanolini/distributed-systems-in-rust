@@ -29,6 +29,10 @@ fn print_all(replicas: &[GCounter], label: &str) {
 }
 
 // One gossip round. `partitioned` decides whether cross-split pairs may talk.
+// NOTE: merges within a round are sequential and in-place, so replica i+1 may pull a
+// state ALREADY enriched this round (a chain like 4→0→1→2→3 can converge in one
+// "round"). Real gossip rounds overlap in exactly this asynchronous way; a synchronous
+// model would snapshot all states at round start and converge more slowly.
 fn round(replicas: &mut Vec<GCounter>, r: usize, partitioned: bool) {
     for i in 0..N {
         let j = (i + r) % N;
@@ -62,7 +66,7 @@ fn main() {
     }
     println!("--- after 3 partitioned rounds ({{0,1}} | {{2,3,4}}) ---");
     print_all(&replicas, "  ");
-    println!("  news crossed only inside each island — no replica knows the other side exists");
+    println!("  news crossed only inside each island — no replica has heard anything from the other side");
 
     // Phase 2: the partition heals. Same rotation, all pairs allowed.
     let mut healed_rounds = 0;

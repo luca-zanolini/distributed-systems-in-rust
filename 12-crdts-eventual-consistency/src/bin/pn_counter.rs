@@ -21,6 +21,8 @@ impl PNCounter {
     }
 
     fn value(&self) -> i64 {
+        // Sound while each pile stays below i64::MAX (`as` would wrap, not saturate) —
+        // comfortably true for counters fed by human-scale events.
         self.pos.value() as i64 - self.neg.value() as i64
     }
 

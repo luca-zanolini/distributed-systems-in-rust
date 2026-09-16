@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-type Tag = (usize, u64); // (replica_id, seq) — globally unique, coordination-free
+// (replica_id, seq) — globally unique WITHOUT coordination, but only under two
+// preconditions this module assumes throughout: replica ids are distinct (assigned
+// at birth, never reused) and each replica mints seqs single-threadedly.
+type Tag = (usize, u64);
 
 struct ORSet {
     id: usize,

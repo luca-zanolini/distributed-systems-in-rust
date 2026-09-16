@@ -13,7 +13,7 @@ build()
 print("== naive_counter: both bad merges photographed ==")
 out = run("naive_counter")
 print(out)
-verdict("merged_max=5" in out and "13" in out,
+verdict("merged_max=5" in out and "AGAIN: 13" in out,
         "max lost 3 increments (5 of 8); add counted the same news twice (13)")
 
 print()

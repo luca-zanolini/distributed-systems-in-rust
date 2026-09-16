@@ -19,6 +19,10 @@ impl GCounter {
     }
 
     pub fn merge(&mut self, other: &Self) {
+        // Precondition: equal widths (static, dense replica ids fixed at birth —
+        // README honest limitation 4). Without the check, zip would silently drop
+        // the other side's extra slots and merge would no longer be a join.
+        assert_eq!(self.slots.len(), other.slots.len(), "GCounter width mismatch");
         for (mine, theirs) in self.slots.iter_mut().zip(&other.slots) {
             *mine = std::cmp::max(*mine, *theirs);
         }

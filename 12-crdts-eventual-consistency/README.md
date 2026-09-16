@@ -49,8 +49,10 @@ In CAP terms this is the AP corner: available under partition, consistency defer
 promised consistency is **strong eventual consistency (SEC)** (Shapiro et al. 2011):
 
 > **Eventual delivery** — an update applied at one correct replica eventually reaches
-> all; **Convergence** — two replicas that have received the *same set* of updates are
-> in the *same state* — regardless of delivery order, grouping, or multiplicity.
+> all correct replicas; **Convergence** — two replicas that have received the *same
+> set* of updates are in the *same state* — regardless of delivery order, grouping, or
+> multiplicity; **Termination** — every method call terminates. (The third clause is
+> trivial here — nothing in this module blocks — but it is part of the paper's triple.)
 
 Note what the second clause quantifies over: the *set*, not the *sequence*. SEC is
 strictly stronger than folklore "eventual consistency" ("stops changing eventually,
@@ -79,9 +81,9 @@ two `u64`s. Both obvious merges fail, each with a familiar disease:
 
 ```
 During partition: a=3, b=5 (true global count: 8)
-After merge (max): merged_max=5          ← 3 increments LOST
-After merge (add): merged_add=8          ← correct…
-B's gossip arrives AGAIN: 13             ← …once. The same news counted twice.
+After merge (max): a=3, b=5, merged_max=5     ← 3 increments LOST
+After merge (add): a=3, b=5, merged_add=8     ← correct…
+B's gossip arrives AGAIN: 13 — the same news counted twice
 ```
 
 The impossibility generalizes: max is duplicate-safe but lossy, add is lossless but
@@ -108,8 +110,9 @@ invariant, "bigger" really does mean "newer" *slot-wise*, so max loses nothing �
 exact property whose absence convicted max in M1, now true by construction. And max is
 idempotent, so duplicates bounce.
 
-The demo tortures delivery on purpose — a duplicate, a weird order, news of replica c
-reaching a only *through* b (transitive relay, no special handling) — and ends:
+The demo tortures delivery on purpose — a duplicate, a weird order, and transitive
+relay with no special handling (a's news reaches c only *through* b, and c's news
+reaches b only *through* a) — and ends:
 
 ```
 final a: [3, 5, 2] = 10
@@ -136,9 +139,11 @@ up), queries that read without writing, and **merge = ⊔** exactly.
 **Theorem (SEC).** Under this contract, two replicas that have absorbed the same *set*
 of updates — any order, any grouping, any multiplicity — are in the same state: the join
 of those updates. *Proof sketch:* ACI makes the join of a finite set well-defined
-independent of arrangement; inflationary updates and join-merges mean every replica's
-state is exactly the join of the updates it has absorbed. The delivery schedule is
-quotiented out by the algebra. ∎
+independent of arrangement; and because each of our updates is itself a join with a
+small delta-state (an increment joins in a one-slot bump; an add joins in one tag),
+every replica's state is exactly the join of the updates it has absorbed. The delivery
+schedule is quotiented out by the algebra. ∎ (For updates that inflate without being
+join-expressible the statement needs more care — ours all are.)
 
 Convergence, in other words, is not achieved by the network — it is *computed* by each
 replica, locally, from whatever fragments arrive. The instructive edge case: `(u64, max)`
@@ -166,8 +171,9 @@ final a: P=[3, 2] N=[1, 0] = 4
 final b: P=[3, 2] N=[1, 0] = 4
 ```
 
-The generalizing trick, used everywhere in CRDT design: **any non-monotone operation
-becomes monotone by recording the *event* instead of applying the *effect*.** Events
+The generalizing trick, used everywhere in CRDT design: **any non-inflationary
+operation becomes inflationary by recording the *event* instead of applying the
+*effect*.** Events
 only accumulate; the value is a query over the event record. (Also the module's first
 **composition**: a product of CRDTs, merged component-wise, is a CRDT.)
 
@@ -197,8 +203,10 @@ adds:  HashMap<String, HashSet<Tag>>,  // element -> every add-event ever
 tombs: HashSet<Tag>,                   // the observed-and-killed events
 ```
 
-Merge = union on both piles (the join, coordinate-wise). The demo runs the three scenes
-that justify the machinery:
+Merge = union on both piles (the join, coordinate-wise). The demo runs three scenes —
+two that *require* the tags (re-add and add-wins are exactly what 2P-Set cannot do)
+and one non-regression check (stale gossip must still bounce — tags must not give back
+what tombstones bought):
 
 ```
 a removes banana:   a contains banana? false
@@ -233,15 +241,18 @@ deterministic rotation — in round r, replica i pulls a state-clone from neighb
   replica 0: [1, 2, 0, 0, 0] = 3     ← knows its island only
   replica 4: [0, 0, 3, 4, 5] = 12    ← a different truth, equally consistent
 --- after 1 healed rounds ---
-  all five: [1, 2, 3, 4, 5] = 15
+  replica 0: [1, 2, 3, 4, 5] = 15      (…and identically for replicas 1–4)
 VERDICT: all 5 replicas identical = 15 — epidemic convergence, zero coordination
 ```
+
+(Output abridged; the binary prints all five per-replica lines.)
 
 Three observations the run makes concrete. **The partition is not an error state:** each
 island serves reads and writes throughout, at full availability — the two truths are
 both honest partial joins, and healing is just more merging, not a recovery protocol.
-**News spreads transitively** — replica 0 learns of replica 4 through intermediaries
-that happened to gossip in the right rotation; in randomized gossip this percolation
+**News spreads transitively** — replica 0 learns of replicas 2 and 3 through replica
+4's state (it never pulls from either directly in the deciding round); in randomized
+gossip this percolation
 completes in O(log n) expected rounds (Demers et al. 1987, the classic epidemic
 analysis). **Direction matters in the small:** our pull-rotation leaves replica 1
 ignorant of replica 0 for all three partitioned rounds — deterministic schedules make
@@ -389,6 +400,9 @@ python3 demos/gossip.py
   Process Group Membership Protocol," *DSN* 2002. Membership as an epidemic dataset.
 - C. Baquero, N. Preguiça, "Why Logical Clocks Are Easy," *CACM* 59(4), 2016. The
   causality toolkit (vector clocks, version vectors) this module quietly reuses.
+- J. M. Hellerstein, P. Alvaro, "Keeping CALM: When Distributed Consistency Is Easy,"
+  *CACM* 63(9), 2020. The theorem behind §7's closing argument: monotone programs
+  have coordination-free consistent implementations — and only they do.
 - M. Kleppmann, *Designing Data-Intensive Applications*, O'Reilly 2017, ch. 5. The
   practitioner's map of replication, conflicts, and convergence.
 

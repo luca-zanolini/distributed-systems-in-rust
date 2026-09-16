@@ -1,8 +1,9 @@
-"""M3b — the OR-Set showdown: the three abilities that justify the tags.
+"""M3b — the OR-Set showdown.
 
-Scene 1: remove then RE-ADD works (a 2P-Set is stuck at false forever).
-Scene 2: a stale replica's gossip cannot resurrect a removed element.
-Scene 3: concurrent remove-vs-add heals to ADD WINS on both replicas.
+Scene 1: remove then RE-ADD works (a 2P-Set is stuck at false forever) — needs tags.
+Scene 2: a stale replica's gossip cannot resurrect a removed element — the
+         non-regression check (2P-Set has this too; tags must not lose it).
+Scene 3: concurrent remove-vs-add heals to ADD WINS on both replicas — needs tags.
 """
 
 from common import build, run, verdict
