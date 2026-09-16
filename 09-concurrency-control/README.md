@@ -286,6 +286,20 @@ Score the engines on this one anomaly and the module's arc inverts:
   al. (1995) introduced it to show SI fits nowhere in the ANSI ladder; Oracle shipped SI
   under the name SERIALIZABLE for years.
 
+The whole divide fits in the two questions the engines ask at commit:
+
+> **OCC asks: "did anything I *read* change?"** — T2 read x, so its stale photograph of x
+> is caught.
+> **MVCC asks: "did anything I *wrote* change?"** — T2 wrote only y, so x is never
+> inspected.
+
+MVCC's narrower question is not a bug but the module's central trade made visible: a
+snapshot makes every read untouchable (whatever others append, `read_at(my snapshot)`
+answers identically forever), so reads *need* no validation — which is exactly what frees
+read-only transactions from ever failing. But "my reads are a consistent picture of my
+snapshot's instant" is not "my reads are still true *now*, at commit" — and a constraint
+over keys you read but did not write lives precisely in that gap.
+
 **The repair, in outline — serializable snapshot isolation** (Cahill–Röhm–Fekete 2008).
 Track, cheaply and pessimistically, the **rw-antidependencies** between concurrent
 transactions (T1 read what T2 wrote); a *dangerous structure* — two consecutive
