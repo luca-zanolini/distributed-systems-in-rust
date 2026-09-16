@@ -90,7 +90,7 @@ fn transfer(store: &Store, from: &str, to: &str, amount: i64) {
             return;
         }
         let to_balance = read(&tx, store, to);
-        thread::sleep(Duration::from_millis(5)); // the gap — fearless, lock-free
+        thread::sleep(Duration::from_millis(1)); // short gap: commit must land INSIDE the auditor's straddle
         write(&mut tx, from, from_balance - amount);
         write(&mut tx, to, to_balance + amount);
         if commit(tx, store) {
@@ -108,7 +108,7 @@ fn transfer(store: &Store, from: &str, to: &str, amount: i64) {
 fn audit(store: &Store) {
     let tx = begin(store);
     let x = read(&tx, store, "x");
-    thread::sleep(Duration::from_millis(5)); // the straddle
+    thread::sleep(Duration::from_millis(10)); // the straddle — wide enough that the transfer commits inside it
     let y = read(&tx, store, "y");
     println!("audit: x={x} y={y} TOTAL {} (first try, no retry)", x + y);
 }

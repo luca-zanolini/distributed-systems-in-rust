@@ -20,9 +20,12 @@ print("== mvcc: writers policed, readers untearable ==")
 done, out, _ = run("mvcc", timeout=10)
 print(out)
 audit_lines = [l for l in out.splitlines() if l.startswith("audit:")]
-verdict(done and "CONFLICT" in out and "TOTAL 230" in out and len(audit_lines) == 1,
-        "deposit race caught (CONFLICT) AND the straddled auditor reported TOTAL 230 "
-        "in exactly one attempt — no retry line exists")
+transfer_before_audit = 0 <= out.find("committed: x ->") < out.find("audit:")
+verdict(done and "CONFLICT" in out and "TOTAL 230" in out and len(audit_lines) == 1
+        and transfer_before_audit,
+        "deposit race caught (CONFLICT) AND the transfer provably committed INSIDE the "
+        "auditor's read gap (committed line precedes audit line) AND the auditor still "
+        "reported TOTAL 230 in exactly one attempt — no retry line exists")
 
 print()
 print("== write_skew: the crack in the armor ==")

@@ -84,8 +84,8 @@ fn audit(store: &Store) {
 
 fn main() {
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
-    store.lock().unwrap().insert("x".into(), (0, 50)); // (version 0, balance 100)
-    store.lock().unwrap().insert("y".into(), (0, 50)); // (version 0, balance 100)
+    store.lock().unwrap().insert("x".into(), (0, 50)); // (version 0, balance 50)
+    store.lock().unwrap().insert("y".into(), (0, 50)); // (version 0, balance 50)
 
     let store_clone2 = Arc::clone(&store);
     let handle2 = thread::spawn(move || {

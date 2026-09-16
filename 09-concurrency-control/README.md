@@ -52,7 +52,7 @@ not a lock. It protects the HashMap's physical integrity for the microseconds of
 read-compute-write appearing atomic) is exactly what a latch cannot provide, and the gap
 between the two tiers is where every anomaly in §2 lives. Real engines draw the same line:
 latches guard pages and nodes; locks guard rows and predicates for a transaction's
-lifetime (Bernstein–Hadzilacos–Goodman's classic split).
+lifetime (the classic split, in Gray & Reuter's terminology).
 
 The correctness standard throughout is **serializability**: the concurrent execution must
 be equivalent to *some* serial order of the transactions (see the course consistency
@@ -96,7 +96,7 @@ It observed a *state that never existed* — half of another transaction.
 The classical taxonomy (Berenson et al. 1995, repairing the ANSI SQL isolation levels)
 names more: **dirty read** (reading a value an uncommitted transaction may yet revoke),
 **non-repeatable read** (read skew confined to one item read twice), **phantoms** (the
-footprint problem for keys that don't exist yet — §7, exercise 8), and **write skew**
+footprint problem for keys that don't exist yet — honest limitation 5, exercise 8), and **write skew**
 (§6, the finale). Each isolation level is defined by which of these it excludes;
 serializability excludes them all.
 
@@ -128,7 +128,8 @@ let _tx_to   = locks.get(to).unwrap().write().unwrap();     // growing
 }   // ← the shrinking phase is the brace: everything at once, at the end
 ```
 
-Holding guards *for the transaction's scope* is precisely strictness; Rust makes the
+Holding *all* guards — read guards included — for the transaction's scope is precisely
+**rigorous** 2PL, the top row of the table, which implies strict; Rust makes the
 sloppy variants (release early, forget to release) harder to write than the correct one.
 Shared/exclusive mode is `RwLock`'s read/write split: the auditor takes `.read()` on both
 keys (auditors don't exclude auditors), transfers take `.write()`.
@@ -139,7 +140,8 @@ keys, so it locks two keys before touching either. An n-item invariant needs an 
 footprint. (Write skew, §6, is exactly what happens to an engine that forgets this law's
 read-side half.)
 
-Both anomalies die on screen: the racing deposits serialize (`read 110` — the second
+Both anomalies die on screen: the racing deposits serialize (`read 110` or `read 120`,
+depending on which deposit wins the race — either way the second
 deposit *sees* the first; final 130, every run), and the auditor is **delayed, not
 deceived** (TOTAL 100; the log shows it waiting out the transfer).
 
@@ -224,13 +226,16 @@ struct Db {
 A transaction is born with a **snapshot timestamp** — the clock at `begin` — and one rule
 governs every read: `read_at` returns the newest version whose commit timestamp is **≤ my
 snapshot** (implemented as a reverse walk down the sorted history). The transaction
-experiences the entire store frozen at one instant. Two reads five milliseconds apart,
+experiences the entire store frozen at one instant. Two reads ten milliseconds apart,
 with a transfer committing in between, *cannot* disagree about the instant they describe:
 
 ```
-audit: x=130 y=100 TOTAL 230 (first try, no retry)
-committed: x -> 100, y -> 130      ← the transfer had already committed; the auditor read the past
+committed: x -> 100, y -> 130      ← the transfer commits INSIDE the auditor's read gap
+audit: x=130 y=100 TOTAL 230 (first try, no retry)   ← …and the auditor reads y as of its snapshot anyway
 ```
+
+(The demo asserts this interleaving — the `committed` line must precede the `audit`
+line — so the exhibit provably exercises the snapshot, not just a quiet store.)
 
 Contrast the engines on the same torn-timing: OCC reads *the present, twice* — and the
 present moved. MVCC reads *a fixed past* — and the past never changes. That is the whole
@@ -239,8 +244,11 @@ an answerable question after time 6 overwrites nothing.
 
 Consequently the read-only transaction's lifecycle collapses: **no commit call exists**.
 It begins, reads, and lets its `Tx` drop — there is nothing to validate, so there is
-nothing that can fail. This is why every serious analytical read in Postgres or Oracle
-runs against a snapshot.
+nothing that can fail. (Scope the "never" honestly: it holds here because versions are
+never garbage-collected. A real engine that evicts old versions can still fail a long
+reader — Oracle's "snapshot too old" — and under SSI even read-only transactions can be
+aborted unless declared deferrable.) This is why every serious analytical read in
+Postgres or Oracle runs against a snapshot.
 
 Writers still race, and MVCC polices them the OCC way — **first-committer-wins**: at
 commit, for each key in my *write set*, if the history contains any version newer than my
@@ -302,7 +310,8 @@ over keys you read but did not write lives precisely in that gap.
 
 **The repair, in outline — serializable snapshot isolation** (Cahill–Röhm–Fekete 2008).
 Track, cheaply and pessimistically, the **rw-antidependencies** between concurrent
-transactions (T1 read what T2 wrote); a *dangerous structure* — two consecutive
+transactions (T1 → T2 when T1 *read* an item of which a concurrent T2 wrote a newer
+version — T1 saw the old one); a *dangerous structure* — two consecutive
 rw-antidependency edges — is the necessary skeleton of every SI anomaly, and aborting one
 transaction in it restores serializability without locks. PostgreSQL's SERIALIZABLE level
 has been exactly this since 9.1 (Ports & Grittner 2012). The manual, folkloric fix is
@@ -317,9 +326,11 @@ exercise 6.
 | naive (latch only) | ✗ admits | ✗ admits | ✗ admits | — | — | correctness |
 | **strict 2PL** | ✓ prevents | ✓ prevents | ✓ prevents* | ✗ its disease | no — but it *waits* | **waiting** |
 | **OCC** | ✓ detects | ✓ detects | ✓ detects | none | **yes** — retries | **wasted work** |
-| **MVCC / SI** | ✓ detects (FCW) | ✓ impossible | ✗ **admits** | none | **no — never** | **storage** |
+| **MVCC / SI** | ✓ detects (FCW) | ✓ impossible | ✗ **admits** | none | **no — never**† | **storage** |
 
 \* given the full footprint (§3); forget the read-side locks and 2PL degrades to SI's blindness.
+† in this engine (unbounded histories, no SSI); real systems can evict old versions
+("snapshot too old") or abort read-only transactions under SSI.
 
 One sentence each: **2PL prevents** — lock everything you touch, conflicting transactions
 wait, nothing bad ever happens. **OCC detects** — run free, check at commit, redo on
@@ -327,7 +338,8 @@ collision. **MVCC sidesteps** — keep every version, read a frozen instant, col
 on writes. Pessimist, optimist, time-traveler — and the engineering choice is a workload
 question: high contention favors locking (retry storms waste more than queues), low
 contention favors optimism, read-heavy analytics demand snapshots. Production engines
-mix all three tiers: PostgreSQL is MVCC with SSI on top and ordinary latches below;
+mix all three tiers: PostgreSQL is MVCC with SSI on top (when SERIALIZABLE is
+requested; the default level is snapshot-style) and ordinary latches below;
 InnoDB pairs MVCC reads with 2PL-style row and next-key locks.
 
 ## Theory ↔ code
@@ -368,6 +380,12 @@ InnoDB pairs MVCC reads with 2PL-style row and next-key locks.
 7. **Single machine.** These locks span threads, not machines. Module 08's `prepared`
    state *is* strict 2PL stretched across a network — and distributed MVCC needs a
    distributed clock, which is Spanner's TrueTime story (planned case-study notes).
+8. **The exhibits are schedule-rigged, not schedule-proof.** The races are made
+   near-deterministic by generous sleeps, not synchronized by barriers; on a heavily
+   loaded machine an exhibit can miss its interleaving (the demo scripts then fail
+   honestly rather than lie). Module 03's closing lesson applies verbatim: a demo can
+   show one schedule, never quantify over all of them — that is the formal-methods
+   bridge's job.
 
 ## Exercises
 
@@ -437,8 +455,8 @@ python3 demos/mvcc.py
 ## References
 
 - P. A. Bernstein, V. Hadzilacos, N. Goodman, *Concurrency Control and Recovery in
-  Database Systems*, Addison-Wesley, 1987. The classical text; latches vs locks,
-  2PL theory, serializability. Freely available from the authors.
+  Database Systems*, Addison-Wesley, 1987. The classical text; 2PL theory,
+  serializability. Freely available from the authors.
 - K. P. Eswaran, J. N. Gray, R. A. Lorie, I. L. Traiger, "The Notions of Consistency and
   Predicate Locks in a Database System," *CACM* 19(11), 1976. The 2PL theorem — and,
   in the same paper, predicate locks and the phantom problem.
