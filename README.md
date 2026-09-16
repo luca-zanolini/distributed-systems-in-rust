@@ -47,7 +47,7 @@ placeholders mark modules whose notes and code are still to come.)
 | 09 | [Concurrency Control](09-concurrency-control/) — anomalies as exhibits; strict 2PL, OCC, MVCC/SI, write skew | serializability mechanisms | ✅ |
 | 10 | [Byzantine Reliable Broadcast](10-byzantine-broadcast/) — Bracha: `3f+1`, echo/ready | Byzantine broadcast (Ch. 3) | ✅ |
 | 11 | [Byzantine Consensus](11-byzantine-consensus/) — PBFT-style: signed certificates, NEW-VIEW, stable storage | Byzantine consensus (Ch. 5) | ✅ |
-| 12 | [Eventual Consistency, CRDTs, Gossip](12-crdts-eventual-consistency/) — SEC, semilattices, anti-entropy | the AP regime | 🔲 planned |
+| 12 | [Eventual Consistency, CRDTs, Gossip](12-crdts-eventual-consistency/) — the merge puzzle; G/PN-Counter, OR-Set; semilattices, SEC, epidemic gossip | the AP regime | ✅ |
 
 **Why Byzantine broadcast (10) precedes Byzantine consensus (11).** Bracha's reliable
 broadcast is the correct first Byzantine primitive: it introduces the `n > 3f` bound,
